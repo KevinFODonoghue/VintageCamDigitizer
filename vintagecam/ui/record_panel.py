@@ -5,6 +5,7 @@ The Recording panel: the big record button, where files go, and live numbers
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Signal
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -65,6 +67,19 @@ class RecordPanel(QWidget):
         form.addRow("Size", self.size_value)
         form.addRow("Data rate", self.rate_value)
         form.addRow("Dropped", self.dropped_value)
+        # Audio level: the loudest sample of the last half second, -60 dB (left) to 0 dB (clipping).
+        self.audio_meter = QProgressBar()
+        self.audio_meter.setRange(-60, 0)
+        self.audio_meter.setValue(-60)
+        self.audio_meter.setTextVisible(False)
+        self.audio_meter.setFixedHeight(10)
+        self.audio_meter.setToolTip("Peak audio level. Keep loud passages below about -6 dB; 0 dB is clipping.")
+        self.audio_value = value_label("—")
+        self.audio_value.setMinimumWidth(70)
+        audio_row = QHBoxLayout()
+        audio_row.addWidget(self.audio_meter, 1)
+        audio_row.addWidget(self.audio_value)
+        form.addRow("Audio", audio_row)
         layout.addWidget(stats)
 
         disk = QGroupBox("Output")
@@ -98,7 +113,8 @@ class RecordPanel(QWidget):
 
         layout.addWidget(muted_label(
             "Video: FFV1 version 3 lossless (16 slices, per-slice CRC, every frame a keyframe), "
-            "4:2:2, in Matroska (.mkv). Plays in VLC. About 30–45 GB per hour."
+            "4:2:2, in Matroska (.mkv). Audio: uncompressed 16-bit PCM, 48 kHz, stereo or mono (Device panel)."
+            "Plays in VLC. About 30–45 GB per hour."
         ))
         layout.addStretch(1)
         self.set_recording(False)
@@ -121,6 +137,16 @@ class RecordPanel(QWidget):
             self.file_value.setToolTip(str(path))
             for label in (self.elapsed_value, self.size_value, self.rate_value, self.dropped_value):
                 label.setText("—")
+        if not on:
+            self.update_audio(None, "—")
+
+    def update_audio(self, level_dbfs: float | None, text: str) -> None:
+        """Show the audio level (None = no audio) and a short status text."""
+        if level_dbfs is None or math.isinf(level_dbfs):
+            self.audio_meter.setValue(-60)
+        else:
+            self.audio_meter.setValue(int(max(-60.0, min(0.0, level_dbfs))))
+        self.audio_value.setText(text)
 
     def update_recording(self, elapsed: float, size: int, bytes_per_second: float | None,
                          dropped: int, device_gaps: int) -> None:

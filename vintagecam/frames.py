@@ -120,7 +120,8 @@ class LatestSlot(Generic[T]):
 
 
 def frame_from_uyvy(
-    uyvy: np.ndarray, standard: VideoStandard, index: int = 0, device_time: float = 0.0
+    uyvy: np.ndarray, standard: VideoStandard, index: int = 0, device_time: float = 0.0,
+    arrival_time: float | None = None,
 ) -> CapturedFrame:
     """Wrap raw UYVY bytes in a CapturedFrame, exactly as if the card had sent them.
 
@@ -135,4 +136,5 @@ def frame_from_uyvy(
     dst[:, :row] = uyvy
     view = dst[:, :row]
     view.flags.writeable = False
-    return CapturedFrame(index, device_time, time.perf_counter(), view, video_frame, standard)
+    arrival = time.perf_counter() if arrival_time is None else arrival_time
+    return CapturedFrame(index, device_time, arrival, view, video_frame, standard)

@@ -66,7 +66,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(warnings, [])
 
     def test_round_trip(self):
-        original = Settings(show_grid=True, video_standard="PAL", low_disk_warning_gb=50.0, deinterlace="bob")
+        original = Settings(show_grid=True, video_standard="PAL", low_disk_warning_gb=50.0, deinterlace="bob",
+                            audio_plug="red")
         save_settings(original, self.path)
         loaded, warnings = load_settings(self.path)
         self.assertEqual(loaded, original)
@@ -79,16 +80,28 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertTrue(self.path.with_suffix(".json.bad").exists())
 
+    def test_settings_from_before_audio_worked_are_migrated_quietly(self):
+        self.path.write_text(json.dumps({
+            "record_audio": False, "audio_device": "Analog Audio In (Elgato Video Capture)",
+        }), encoding="utf-8")
+        settings, warnings = load_settings(self.path)
+        self.assertEqual(warnings, [])
+        self.assertTrue(settings.audio_enabled)
+        self.assertEqual(settings.audio_device, "auto")
+        self.assertEqual(settings.audio_plug, "both")  # stereo unless chosen otherwise
+
     def test_bad_values_are_repaired_and_reported(self):
         self.path.write_text(json.dumps({
             "video_standard": "SECAM", "show_grid": "yes", "bogus": 1, "low_disk_warning_gb": 5, "deinterlace": "x",
+            "audio_plug": "green",
         }), encoding="utf-8")
         settings, warnings = load_settings(self.path)
         self.assertEqual(settings.video_standard, "NTSC")
         self.assertEqual(settings.show_grid, Settings().show_grid)  # "yes" isn't a bool -> default
         self.assertEqual(settings.low_disk_warning_gb, 5.0)  # ints are fine for floats
         self.assertEqual(settings.deinterlace, "off")
-        self.assertEqual(len(warnings), 4)
+        self.assertEqual(settings.audio_plug, "both")
+        self.assertEqual(len(warnings), 5)
 
 
 class CaptureOptions(unittest.TestCase):

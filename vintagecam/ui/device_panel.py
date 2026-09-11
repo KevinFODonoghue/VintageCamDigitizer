@@ -1,6 +1,6 @@
 """
 The Device panel: which device, which input, which TV standard, the card's proc
-amp, and whether a picture signal is arriving.
+amp, whether a picture signal is arriving, and where the sound comes from.
 
 It only shows state and reports what the user changed (Qt signals).  The main
 window does the actual work.
@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..capture import CaptureState
-from ..config import VIDEO_INPUT_LABELS, Settings
+from ..config import AUDIO_PLUG_LABELS, VIDEO_INPUT_LABELS, Settings
 from ..dshow import ProcAmp, ProcAmpRange
 from ..video_format import STANDARDS
 from .theme import ERROR_RED, MUTED, OK_GREEN, WARN_AMBER
@@ -65,6 +65,7 @@ class DevicePanel(QWidget):
     proc_amp_edited = Signal(object, int)  # (ProcAmp, value)
     reset_neutral_clicked = Signal()
     audio_device_selected = Signal(str)
+    audio_plug_selected = Signal(str)
     record_audio_toggled = Signal(bool)
 
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
@@ -197,16 +198,30 @@ class DevicePanel(QWidget):
         grid = QGridLayout(box)
         grid.setColumnStretch(1, 1)
         self.audio_combo = QComboBox()
+        self.audio_combo.setToolTip("Where the sound comes from. Automatic = the Elgato's red/white RCA jacks.")
         self.audio_combo.activated.connect(lambda i: self.audio_device_selected.emit(self.audio_combo.itemData(i) or ""))
-        self.record_audio_check = QCheckBox("Record audio (PCM) with the video")
-        self.record_audio_check.setChecked(settings.record_audio)
+        self.audio_plug_combo = QComboBox()
+        for key, label in AUDIO_PLUG_LABELS.items():
+            self.audio_plug_combo.addItem(label, key)
+        self.audio_plug_combo.setCurrentIndex(max(0, self.audio_plug_combo.findData(settings.audio_plug)))
+        self.audio_plug_combo.setToolTip(
+            "Which of the Elgato's RCA audio plugs to record (red = right, white = left).\n"
+            "Stereo records both; the mono choices record one plug's channel on its own."
+        )
+        self.audio_plug_combo.activated.connect(
+            lambda i: self.audio_plug_selected.emit(self.audio_plug_combo.itemData(i))
+        )
+        self.record_audio_check = QCheckBox("Record audio with the video (48 kHz PCM)")
+        self.record_audio_check.setChecked(settings.audio_enabled)
         self.record_audio_check.toggled.connect(self.record_audio_toggled)
         self.audio_note = muted_label()
-        grid.addWidget(QLabel("Device"), 0, 0)
+        grid.addWidget(QLabel("Input"), 0, 0)
         grid.addWidget(self.audio_combo, 0, 1)
-        grid.addWidget(self.record_audio_check, 1, 0, 1, 2)
-        grid.addWidget(self.audio_note, 2, 0, 1, 2)
-        _no_focus(self.audio_combo, self.record_audio_check)
+        grid.addWidget(QLabel("Plug"), 1, 0)
+        grid.addWidget(self.audio_plug_combo, 1, 1)
+        grid.addWidget(self.record_audio_check, 2, 0, 1, 2)
+        grid.addWidget(self.audio_note, 3, 0, 1, 2)
+        _no_focus(self.audio_combo, self.audio_plug_combo, self.record_audio_check)
         return box
 
     # -- updates from the main window --------------------------------------------
@@ -225,12 +240,23 @@ class DevicePanel(QWidget):
     def set_video_devices(self, names: list[str], current: str) -> None:
         self._fill(self.device_combo, names, current)
 
-    def set_audio_devices(self, names: list[str], current: str) -> None:
-        self._fill(self.audio_combo, names, current)
+    def set_audio_inputs(self, items: list[tuple[str, str]], current: str) -> None:
+        """``items`` are (label, key) pairs; ``current`` is the saved key."""
+        combo = self.audio_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for label, key in items:
+            combo.addItem(label, key)
+        index = combo.findData(current)
+        if index < 0 and current:
+            combo.addItem(f"{current.split('::')[-1]}  (not connected)", current)
+            index = combo.count() - 1
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
 
     def set_audio_available(self, available: bool, note: str) -> None:
-        self.audio_combo.setEnabled(available)
-        self.record_audio_check.setEnabled(available)
+        for w in (self.audio_combo, self.audio_plug_combo, self.record_audio_check):
+            w.setEnabled(available)
         self.audio_note.setText(note)
         self.audio_note.setVisible(bool(note))
 
@@ -251,7 +277,8 @@ class DevicePanel(QWidget):
 
     def set_device_controls_enabled(self, enabled: bool, note: str = "") -> None:
         """Device, input and standard can't change mid-recording (it would reopen the device)."""
-        for w in (self.device_combo, self.refresh_button, self.standard_combo, *self.input_buttons.buttons()):
+        for w in (self.device_combo, self.refresh_button, self.standard_combo, *self.input_buttons.buttons(),
+                  self.audio_combo, self.audio_plug_combo, self.record_audio_check):
             w.setEnabled(enabled)
         self.controls_note.setText(note)
         self.controls_note.setVisible(bool(note) and not enabled)

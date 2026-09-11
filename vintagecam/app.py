@@ -79,6 +79,7 @@ def run(argv: list[str] | None = None) -> int:
     # Developer aids: save a screenshot of the window when it closes, and/or close after N seconds.
     parser.add_argument("--screenshot", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--quit-after", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--auto-record", type=float, help=argparse.SUPPRESS)  # record N s once live, then quit
     args = parser.parse_args(argv)
 
     log_dir = _setup_logging()
@@ -115,5 +116,22 @@ def run(argv: list[str] | None = None) -> int:
         window.screenshot_on_close = args.screenshot  # taken in closeEvent, however the window closes
     if args.quit_after:
         QTimer.singleShot(int(args.quit_after * 1000), window.close)
+    if args.auto_record:  # exercises the whole record path, exactly as pressing R would
+        def begin() -> None:
+            if not window.is_live():
+                QTimer.singleShot(250, begin)
+                return
+            window.toggle_recording()
+            QTimer.singleShot(int(args.auto_record * 1000), end)
+
+        def end() -> None:
+            if args.screenshot:  # mid-recording, while the level meter is moving
+                window.grab().save(str(args.screenshot))
+                log.info("Screenshot saved to %s", args.screenshot)
+                window.screenshot_on_close = None
+            window.toggle_recording()
+            QTimer.singleShot(3000, window.close)  # give the file a moment to be finalised
+
+        QTimer.singleShot(500, begin)
 
     return app.exec()

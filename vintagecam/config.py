@@ -27,10 +27,15 @@ log = logging.getLogger(__name__)
 # Hardware constants, verified on the target machine (CLAUDE_CODE_PROMPT.md).
 # -----------------------------------------------------------------------------
 
-#: Exact DirectShow "friendly names".  FFmpeg finds devices by this string, so a
+#: Exact DirectShow "friendly name".  FFmpeg finds devices by this string, so a
 #: single wrong character means "device not found".
 DEFAULT_VIDEO_DEVICE = "Elgato Video Capture"
+#: DirectShow's name for the card's audio.  That route doesn't work on this PC
+#: (audio.py explains); kept only to recognise it in older settings files.
 DEFAULT_AUDIO_DEVICE = "Analog Audio In (Elgato Video Capture)"
+
+#: Settings from earlier versions that are now ignored without a warning.
+_OBSOLETE_SETTINGS = {"record_audio"}
 
 #: Crossbar input pins.  A crossbar is the switch inside the card that picks which
 #: physical connector feeds the decoder chip.  The numbers come from
@@ -42,6 +47,18 @@ VIDEO_INPUT_LABELS: dict[str, str] = {"composite": "Composite", "svideo": "S-Vid
 #: this machine it was found *unrouted* (-1) after a replug, which leaves the
 #: card's audio path dead, so we route it explicitly every time we open.
 CROSSBAR_AUDIO_LINE_PIN = 2
+
+#: The Elgato's two RCA audio plugs are the two channels of its stereo input, with
+#: the usual colour code: white = left (channel 0), red = right (channel 1).
+#: Stereo (both plugs) is the default; the mono choices record one plug's channel
+#: on its own.  (With the RCA camera's lead in the red jack alone, the Elgato
+#: delivers its sound on both channels, equally: measured 2026-09-11.)
+AUDIO_PLUGS: dict[str, tuple[int, ...]] = {"both": (0, 1), "red": (1,), "white": (0,)}
+AUDIO_PLUG_LABELS: dict[str, str] = {
+    "both": "Red + white (stereo)",
+    "red": "Red plug only (mono)",
+    "white": "White plug only (mono)",
+}
 
 DEINTERLACE_MODES = ("off", "bob", "blend")
 FIELD_ORDERS = ("auto", "tff", "bff")
@@ -78,7 +95,10 @@ class Settings:
 
     # --- device ---------------------------------------------------------------
     video_device: str = DEFAULT_VIDEO_DEVICE
-    audio_device: str = DEFAULT_AUDIO_DEVICE
+    #: "auto" = the Elgato's line input; otherwise an audio.AudioInput key.
+    audio_device: str = "auto"
+    #: Which of the Elgato's audio plugs to record: a key of AUDIO_PLUGS.
+    audio_plug: str = "both"
     video_input: str = "composite"  # key of CROSSBAR_VIDEO_PINS
     video_standard: str = "NTSC"  # key of video_format.STANDARDS
     #: FFmpeg's real-time buffer: how much video DirectShow may queue while the
@@ -89,7 +109,9 @@ class Settings:
     # --- recording ------------------------------------------------------------
     output_dir: str = field(default_factory=_default_output_dir)
     filename_prefix: str = "capture"
-    record_audio: bool = False
+    audio_enabled: bool = True  # record 48 kHz PCM with the video when an audio input works
+    #: Nudge the sound relative to the picture: positive = sound later (ms).
+    av_sync_offset_ms: float = 0.0
     low_disk_warning_gb: float = 20.0  # warn below this much free space
     low_disk_stop_gb: float = 2.0  # stop recording cleanly below this
 
@@ -119,6 +141,8 @@ class Settings:
 
         if self.video_input not in CROSSBAR_VIDEO_PINS:
             reset("video_input", f"{self.video_input!r} is not one of {list(CROSSBAR_VIDEO_PINS)}")
+        if self.audio_plug not in AUDIO_PLUGS:
+            reset("audio_plug", f"{self.audio_plug!r} is not one of {list(AUDIO_PLUGS)}")
         if self.video_standard not in STANDARDS:
             reset("video_standard", f"{self.video_standard!r} is not one of {list(STANDARDS)}")
         if self.deinterlace not in DEINTERLACE_MODES:
@@ -129,6 +153,8 @@ class Settings:
             reset("video_device", "is empty")
         if not self.output_dir.strip():
             reset("output_dir", "is empty")
+        if self.audio_device in ("", DEFAULT_AUDIO_DEVICE):  # the old, unusable DirectShow route
+            self.audio_device = "auto"
         if not (self.low_disk_warning_gb >= self.low_disk_stop_gb >= 0):
             reset("low_disk_warning_gb", "must be >= low_disk_stop_gb >= 0")
             reset("low_disk_stop_gb", "must be >= 0")
@@ -164,6 +190,8 @@ def load_settings(path: Path | None = None) -> tuple[Settings, list[str]]:
     settings = Settings()
     known = {f.name for f in fields(Settings)}
     for key, value in raw.items():
+        if key in _OBSOLETE_SETTINGS:
+            continue
         if key not in known:
             warnings.append(f"settings.json: ignoring unknown setting {key!r}")
             continue

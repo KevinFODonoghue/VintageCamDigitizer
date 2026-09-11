@@ -68,7 +68,7 @@ The full notes are in [docs/SETUP.md](docs/SETUP.md). In short:
 |---|---|
 | **Picture** (centre) | The live feed with overlays. Top left: status (live, frames per second, standard, input). Top right: `● REC` while recording. Warnings appear top centre. |
 | **Device** (right) | The capture device, input (Composite / S-Video), TV standard, signal lock, and the **proc amp** (the card's own brightness, contrast, saturation and hue). |
-| **Recording** (right) | The big record button, elapsed time, file size, data rate, free disk space and time left, and dropped frames. |
+| **Recording** (right) | The big record button, elapsed time, file size, data rate, free disk space and time left, dropped frames, and the audio level. |
 | **Log** (bottom) | Everything that happens, with a timestamp. Warnings are amber and errors red. Nothing fails silently. A full debug log goes to `logs/vintagecam.log`. |
 | **Status bar** | Capture state, measured fps, the app's display lag, and any frames dropped by the device. |
 
@@ -191,6 +191,7 @@ Phase 2 will add **V** (vectorscope), **W** (waveform) and **H** (hold reading).
 | Elapsed | Length of video in the file |
 | Size / Data rate | FFV1 is lossless, so size depends on the picture. About 20 GB/h on a mostly-white test chart, typically 30–45 GB/h on real footage. Noise costs bits. |
 | Dropped | "lost" = frames the disk couldn't keep up with (should always be 0). "skipped by device" = frames the card never delivered (kept as timing gaps, so the rest stays in sync). |
+| Audio | Peak level of the sound over the last half second. Keep loud passages below about −6 dB; 0 dB means clipping. "silence" means nothing is coming in. |
 | Free space / Time left | At the current data rate. An amber warning appears below 20 GB free. Below 2 GB the recording stops cleanly, so the file isn't damaged by a full disk. |
 
 ---
@@ -257,7 +258,8 @@ more depth, right next to the code that uses them.
   Video → Deinterlace for smooth motion.
 - **Verify integrity at any time:** `ffmpeg -v error -i file.mkv -f null -`
   prints nothing for an intact file.
-- **Audio:** not available on this PC. See [Audio](#audio).
+- **Audio (optional):** uncompressed 16-bit PCM, 48 kHz stereo, next to the
+  video. See [Audio](#audio).
 
 ## Troubleshooting
 
@@ -269,6 +271,7 @@ more depth, right next to the code that uses them.
 | "refused the requested video format" | The wrong standard is selected (NTSC for this camera), or a different device is selected. |
 | Picture freezes and the app says "stopped responding… reconnecting" | The device dropped off USB. It reconnects automatically. If you were recording, the file up to that point is saved and closed properly. |
 | Amber "PROC AMP NOT NEUTRAL" | Click **Reset all to neutral** in the Device panel. |
+| "The Elgato's driver stopped responding…" | The driver can hang when a stream in the wrong TV standard is closed (seen: switching to PAL with this NTSC camera, then back). Unplug the Elgato for 5 s and plug it back in; capture restarts by itself. The app asks before you switch away from a locked picture. If the app was closed while the driver was stuck, Windows can't end it until you unplug the card. |
 
 **Don't "fix" the frame rate to 30000/1001.** The app asks for `29.97`
 deliberately. FFmpeg converts the rate into 100-ns ticks with integer division:
@@ -282,38 +285,77 @@ bug.
 
 ## Audio
 
-The brief planned PCM audio from the separate DirectShow device
-`"Analog Audio In (Elgato Video Capture)"`. On this PC that device won't open,
-whatever method is used:
+Audio recording works, through a different Windows route from the one the
+brief planned. What's been verified, and how, is at the end of this section.
 
-- **FFmpeg / DirectShow:** fails with "Could not find output pin from audio only
-  capture device" (and "Could not set audio only options" with a format given).
-  This happens alone, alongside the video input, and with the card's crossbar
-  audio routed to *Audio Line*.
-- **The raw Windows `waveIn` API:** refuses every PCM format (`WAVERR_BADFORMAT`),
-  even though it claims to support them.
-- **WASAPI** (Windows' modern audio API) can't even read the endpoint's shared
-  format: `GetMixFormat` fails with `AUDCLNT_E_UNSUPPORTED_FORMAT` (0x88890008).
+- The camera's sound goes into the Elgato's **RCA audio jacks** (red = right,
+  white = left), next to the yellow video plug. With the camera's lead in the
+  red jack, the Elgato delivers its sound on both channels.
+- **Record audio with the video** is on by default (Device panel). Recordings then
+  carry uncompressed 16-bit, 48 kHz PCM next to the FFV1 video, and the
+  Recording panel shows a level meter. Keep loud passages below about −6 dB.
+- **Plug** (Device panel → Audio) picks what's recorded: **red + white as
+  stereo** (the default), or one plug's channel on its own as a mono track.
+  With this camera both channels carry the same sound, so mono only saves
+  space (about 0.3 GB an hour, under 1% of the video).
+- There's only sound **while video is live**: the card switches its audio path
+  on together with the video decoder. A recording always runs with video, so in
+  practice this doesn't matter.
 
-So the endpoint's configured default format is one its 2014 driver won't accept.
-Video is unaffected, and the Audio box in the Device panel explains the
-situation. The tube camera's composite output carries no sound anyway; audio
-would matter for digitising tapes later.
+**Why a different route.** The brief planned to use the DirectShow audio device
+"Analog Audio In (Elgato Video Capture)". On this PC, every route through
+Windows' audio engine refuses it:
 
-**Something you can try** (it's a Windows setting, so the app doesn't change it
-for you):
+- FFmpeg/DirectShow: "Could not find output pin from audio only capture device";
+- waveIn: `WAVERR_BADFORMAT`;
+- DirectSound: fails to open;
+- WASAPI, shared and exclusive: `AUDCLNT_E_UNSUPPORTED_FORMAT`.
 
-1. Open Sound settings → *More sound settings* → **Recording** tab.
-2. Open **Analog Audio In (Elgato Video Capture)** → **Properties** → **Advanced**.
-3. Set *Default Format* to **2 channel, 16 bit, 48000 Hz** and click **Apply**.
-4. Test it:
+The engine has no format stored for this endpoint, and the driver rejects every
+stream it's asked for. **Kernel streaming (WDM-KS)** reaches the driver's audio
+filter directly, underneath the engine, and works. The app uses it through the
+`sounddevice` package (PortAudio). `vintagecam/audio.py` explains the details.
 
-   ```powershell
-   ffmpeg -f dshow -i audio="Analog Audio In (Elgato Video Capture)" -t 3 -f null -
-   ```
+**Two measured quirks:**
 
-If that command stops failing, audio capture can be wired into the recorder as
-the brief intended.
+- The chip always delivers **48 000 samples per second**, whatever rate is asked
+  for, so the app always asks for 48 kHz. Asking for 44.1 kHz would label
+  48 kHz sound as 44.1 kHz, and it would play 9% slow.
+- With video closed, the input still runs, but every sample is zero.
+
+**Staying in sync.** Each block of sound is placed by when it was captured,
+relative to the latest video frame. The camera's frame rate and the card's
+audio clock both differ from nominal by tens of parts per million, so the
+recorder now and then drops or repeats a single sample (inaudible) to keep the
+sound within 10 ms of the picture. Sound reaches the app up to ~0.4 s after it
+was captured, so when you press Stop the recording keeps taking the sound still
+in the buffers, then cuts it to end exactly with the last frame. If the sound
+seems early or late overall, set `av_sync_offset_ms` in settings.json
+(positive = sound later).
+
+**What's verified.**
+
+- **Sound reaching the camera is recorded correctly** (2026-09-11, with
+  `tools/camera_sound_check.py`). The tool plays a 1 kHz and a 440 Hz tone
+  through the laptop's speakers; the camera's microphone picks them up, and the
+  app's own capture and recording code records them. In the file they measured
+  999.96 Hz and 440.01 Hz (so the 48 kHz label is right), 57 and 41 dB above
+  the surrounding sound, with peaks at −14 dBFS (no clipping).
+- The tones came back **at the same level on both channels**, with the camera's
+  lead in the red jack. Without a test signal, the two channels were 0.998
+  correlated between 150 Hz and 4 kHz. So a stereo recording of this camera
+  holds the same sound twice.
+- Kernel streaming delivers 48,000 samples a second. With video closed, every
+  sample is exactly zero.
+- With the camera on, the input also carries interference. Its strongest lines,
+  the NTSC line frequency (15,734 Hz) and 60 Hz hum, measured −54 and −58 dBFS.
+  With the camera off, there's a −73 dBFS noise floor with faint USB tones
+  (8 and 16 kHz).
+- Recordings keep sound and picture together, including through a deliberate
+  freeze.
+- *On Linux* (cx231xx driver; the chip identifies as a CX23102), the same input
+  offered 48 kHz stereo S16. It was only shown to open there, not to contain
+  sound.
 
 ## Verified on the target machine
 
@@ -325,7 +367,7 @@ Measured with `tools/hardware_check.py` and the tests, on 2026-09-10:
 | Frame rate | 29.968 fps over 60 s (camera within 60 ppm of NTSC) |
 | Dropped frames | 0 |
 | Timestamp jitter | σ 4.7 ms (DirectShow quantises to ~10 ms; handled) |
-| Card → software latency | median 59 ms (a brightness change timed until it appeared in frames) |
+| Card → software latency | median 41–59 ms over three runs (a brightness change timed until it appeared in frames) |
 | App display lag | 2 ms from a frame arriving off the card to being drawn |
 | App start → live picture | about 1 s |
 | Proc amp on the live stream | works, and is restored afterwards |
@@ -334,12 +376,16 @@ Measured with `tools/hardware_check.py` and the tests, on 2026-09-10:
 | Device in use by another program | detected and explained; resumes automatically |
 | Unplug / replug | unplugged twice, once mid-recording: the recording was stopped and finalised (193 frames, decodes cleanly), and live video came back by itself after each replug, including a flaky re-plug that dropped out once |
 | Camera signal lost | "NO SIGNAL" shown within a second; cleared by itself when the signal returned |
+| Sound (kernel streaming) | ~48,000 samples/s arriving (48 kHz). Recordings have no gaps or overflows, even through a deliberate 0.3 s freeze of the program, and the sound ends within 1 ms of the picture |
+| Sound from the camera (2026-09-11, `tools/camera_sound_check.py`) | test tones picked up by the camera's microphone come back at the right pitch (999.96 and 440.01 Hz), 41–57 dB above the surrounding sound, equally on both channels, without clipping |
+| Other Windows audio routes | DirectShow, waveIn, DirectSound and WASAPI (shared and exclusive) all refuse this card's audio |
 
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python -m unittest discover -s tests -t .    # no hardware needed, ~1 s
-.\.venv\Scripts\python tools\hardware_check.py                # needs the Elgato, ~35 s
+.\.venv\Scripts\python -m unittest discover -s tests -t .    # no hardware needed, ~3 s
+.\.venv\Scripts\python tools\hardware_check.py                # needs the Elgato, ~50 s
+.\.venv\Scripts\python tools\camera_sound_check.py            # needs the camera on; plays tones, ~15 s
 ```
 
 The unit tests cover:
@@ -353,8 +399,12 @@ The unit tests cover:
 - settings handling;
 - error classification;
 - the 29.97 guard;
+- audio stored bit-for-bit and starting in step with the video, and sync holding
+  when the audio clock runs fast;
+- choosing the audio input (with a stand-in for PortAudio);
 - the real main window, run off-screen: every overlay shortcut toggles,
-  deinterlace cycles, freeze works, and a frame is drawn in true colour.
+  deinterlace cycles, freeze works, a frame is drawn in true colour, a stuck
+  driver is waited out, and switching away from a locked picture asks first.
 
 ## Project layout
 
@@ -365,7 +415,8 @@ vintagecam/
   color.py                Y'CbCr maths, UYVY layout, deinterlacers, staircase (pure numpy)
   frames.py               CapturedFrame and LatestSlot (drop-on-late hand-off between threads)
   capture.py              CaptureThread: owns the device, fans frames out, reconnects
-  recorder.py             RecordThread: FFV1/MKV writer that never blocks capture
+  recorder.py             RecordThread: FFV1 (+ PCM sound) MKV writer that never blocks capture
+  audio.py                the Elgato's line input via Windows kernel streaming (sounddevice / PortAudio)
   render.py               preview colour conversion (BT.601, limited -> full range)
   dshow.py                DirectShow COM via ctypes: device list, proc amp, TV standard, signal lock
   errors.py               FFmpeg/DirectShow failures -> messages you can act on

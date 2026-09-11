@@ -16,6 +16,7 @@ latency.  It always puts brightness back to where it was.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import statistics
 import sys
 import threading
@@ -44,6 +45,10 @@ def check(name: str, ok: bool, detail: str) -> bool:
     _failures += not ok
     print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}", flush=True)
     return ok
+
+
+def skip(name: str, detail: str) -> None:
+    print(f"[SKIP] {name}: {detail}", flush=True)
 
 
 class Probe:
@@ -107,6 +112,56 @@ def measure_procamp(probe: Probe, controls: dshow.VideoDeviceControls, rng: dsho
               "waiting for the decoder to apply the change)")
 
 
+def record_with_audio(probe: Probe, device, args: argparse.Namespace) -> None:
+    """Record video and sound together, then check the sound track."""
+    from vintagecam.audio import AudioCapture, AudioError
+
+    audio = AudioCapture(device)
+    try:
+        audio.start()
+    except AudioError as exc:
+        check("audio opens", False, str(exc))
+        return
+    check("audio opens", True, f"{device.label}, asked for {audio.rate} Hz")
+    path = make_recording_path(args.out, "hwcheck_av")
+    finished = []
+    recorder = RecordThread(path, NTSC, on_finished=finished.append, comment="tools/hardware_check.py (audio)",
+                            audio_rate=audio.rate, audio_channels=audio.channels)
+    recorder.start()
+    recorder.opened.wait(10)
+    probe.recorder = recorder
+    audio.sink = recorder.offer_audio
+    time.sleep(args.seconds / 2)
+    # Freeze Python for 0.3 s — a DLL call that keeps Python's lock, as a heavy GUI
+    # redraw would.  Sound must neither be lost nor be mistaken for lost.
+    ctypes.PyDLL("kernel32").Sleep(300)
+    time.sleep(args.seconds / 2)
+    measured, overflows = audio.measured_rate(), audio.overflows
+    probe.recorder = None  # the picture ends here, as when you press Stop
+    recorder.stop()  # the recorder still takes the sound waiting in the audio buffers…
+    recorder.join(60)
+    audio.stop()  # …so the input is only stopped once the file is closed
+    result = finished[0]
+    check("audio recorded through a 0.3 s freeze",
+          result.error is None and bool(result.audio_seconds) and result.audio_gaps == 0 and overflows == 0,
+          f"picture {result.duration:.2f} s, sound {result.audio_seconds or 0:.2f} s, "
+          f"{result.audio_adjustments} sync adjustments, {result.audio_gaps} gaps, {overflows} input overflows")
+    check("audio sample rate", measured is not None and abs(measured / audio.rate - 1) < 0.01,
+          f"{measured:,.0f} samples/s arriving, {audio.rate:,} expected" if measured else "not measured")
+    with av.open(str(path)) as container:
+        frames = list(container.decode(container.streams.audio[0]))
+    samples = (np.concatenate([f.to_ndarray().reshape(-1, audio.channels) for f in frames])
+               if frames else np.zeros((0, audio.channels), np.int16))
+    live = np.count_nonzero(samples) / max(1, samples.size)
+    peak = int(np.abs(samples.astype(np.int32)).max()) if samples.size else 0
+    check("audio is live", live > 0.5, f"{live:.0%} of samples non-zero (digital silence would be 0%), peak {peak}/32767")
+    start = frames[0].time if frames else 0.0
+    end = start + len(samples) / audio.rate
+    check("sound lines up with picture", bool(frames) and abs(end - result.duration) < 0.05,
+          f"sound runs {start:.3f}-{end:.3f} s, picture ends at {result.duration:.3f} s")
+    print(f"\n       recording with sound: {path}")
+
+
 def main() -> int:
     # A redirected Windows console uses a legacy code page that can't print σ or —.
     sys.stdout.reconfigure(errors="replace")
@@ -129,8 +184,23 @@ def main() -> int:
           ", ".join(f"{p.label} {v} (neutral {ranges[p].default})" for p, v in values.items()))
     neutral = all(v == ranges[p].default for p, v in values.items())
     check("proc amp at neutral", neutral, "all at the driver's defaults" if neutral else "NOT at neutral")
+    have_signal = controls.horizontal_locked()
     check("decoder status", True, f"TV format 0x{controls.tv_format():X}, {controls.number_of_lines()} lines, "
-          f"signal {'locked' if controls.horizontal_locked() else 'NOT locked'}")
+          f"signal {'locked' if have_signal else 'NOT locked'}")
+    if not have_signal:
+        print("       NO SIGNAL: is the camera on and connected? Checks that need a picture are skipped.")
+
+    # Audio inputs are listed now, before video opens: PortAudio's scan briefly
+    # opens the card's audio filter, which must not collide with opening video.
+    elgato_audio = None
+    try:
+        from vintagecam import audio as audio_io
+
+        elgato_audio = audio_io.find_input(audio_io.AUTO, audio_io.list_inputs())
+    except Exception as exc:
+        print(f"       (audio inputs couldn't be listed: {exc})")
+    check("audio input listed", elgato_audio is not None,
+          elgato_audio.label if elgato_audio else "no kernel-streaming 'Analog Audio In' input found")
 
     # 2. Streaming through the real CaptureThread.
     probe = Probe()
@@ -157,14 +227,20 @@ def main() -> int:
         gaps = int(sum(max(0, round(i / NTSC.frame_duration) - 1) for i in intervals))
         fps_dev = (len(device_t) - 1) / (device_t[-1] - device_t[0])
         fps_arr = (len(arrival) - 1) / (arrival[-1] - arrival[0])
-        check("frame rate", abs(fps_dev - NTSC.fps) < 0.05,
-              f"{fps_dev:.3f} fps by device clock, {fps_arr:.3f} fps by arrival; timestamp jitter "
-              f"σ {np.std(intervals) * 1000:.1f} ms; largest arrival gap {np.max(np.diff(arrival)) * 1000:.0f} ms")
+        detail = (f"{fps_dev:.3f} fps by device clock, {fps_arr:.3f} fps by arrival; timestamp jitter "
+                  f"σ {np.std(intervals) * 1000:.1f} ms; largest arrival gap {np.max(np.diff(arrival)) * 1000:.0f} ms")
+        if have_signal:
+            check("frame rate", abs(fps_dev - NTSC.fps) < 0.05, detail)
+        else:
+            skip("frame rate", detail + " (without a signal the decoder free-runs)")
         check("no dropped frames", gaps == 0, f"{gaps} gaps in {len(samples)} frames")
 
         # 3. Proc amp on the live stream, and capture latency.
         if not args.no_procamp and ProcAmp.BRIGHTNESS in values:
-            measure_procamp(probe, controls, ranges[ProcAmp.BRIGHTNESS], values[ProcAmp.BRIGHTNESS])
+            if have_signal:
+                measure_procamp(probe, controls, ranges[ProcAmp.BRIGHTNESS], values[ProcAmp.BRIGHTNESS])
+            else:
+                skip("proc amp on the live stream / capture latency", "needs a picture to measure")
 
         # 4. A real recording, checked frame by frame.
         path = make_recording_path(args.out, "hwcheck")
@@ -200,6 +276,10 @@ def main() -> int:
         exact = bool(decoded) and all(np.array_equal(d, uyvy_to_planar(s.uyvy)) for d, s in zip(decoded, probe.sent))
         check("bit-exact", exact, f"first {len(decoded)} recorded frames identical, byte for byte, to what the card sent")
         print(f"\n       recording: {path}")
+
+        # 5. Sound: the Elgato's line input via kernel streaming, recorded with the picture.
+        if elgato_audio is not None:
+            record_with_audio(probe, elgato_audio, args)
     finally:
         capture.stop()
         capture.join(10)

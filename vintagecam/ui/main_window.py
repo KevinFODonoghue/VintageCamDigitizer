@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import textwrap
 import time
 from pathlib import Path
@@ -24,8 +25,11 @@ from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices, 
 from PySide6.QtWidgets import QDockWidget, QFrame, QLabel, QMainWindow, QMessageBox, QScrollArea, QWidget
 
 from .. import APP_NAME, __version__, dshow
+from .. import audio as audio_io
+from ..audio import AUTO, AudioCapture, AudioError, AudioInput
 from ..capture import CaptureRequest, CaptureState, CaptureStats, CaptureThread
-from ..config import DEINTERLACE_MODES, TYPICAL_GB_PER_HOUR, VIDEO_INPUT_LABELS, Settings, save_settings
+from ..config import (AUDIO_PLUG_LABELS, DEINTERLACE_MODES, TYPICAL_GB_PER_HOUR, VIDEO_INPUT_LABELS, Settings,
+                      save_settings)
 from ..dshow import DShowError, ProcAmp, ProcAmpRange
 from ..errors import CaptureError
 from ..frames import CapturedFrame
@@ -104,6 +108,13 @@ class MainWindow(QMainWindow):
         self._disk_warned = False
         self.screenshot_on_close: Path | None = None
         """Developer aid (``main.py --screenshot FILE``): grab the window just before it closes."""
+        self._stuck_capture: CaptureThread | None = None
+        """A capture thread that never finished stopping because the driver hung (see _stop_capture)."""
+        self._restart_pending = False
+        self.audio: AudioCapture | None = None
+        self._audio_inputs: list[AudioInput] = []
+        self._audio_progress = (0, 0.0)  # (frames seen, when they last increased)
+        self._audio_warned = False
 
         self.bridge = WorkerBridge(self)
         queued = Qt.ConnectionType.QueuedConnection
@@ -127,6 +138,9 @@ class MainWindow(QMainWindow):
         self.signal_timer.setInterval(1000)
         self.signal_timer.timeout.connect(self._poll_signal)
         self.signal_timer.start()
+        self.stuck_timer = QTimer(self)
+        self.stuck_timer.setInterval(1000)
+        self.stuck_timer.timeout.connect(self._check_stuck_capture)
 
         log.info("%s %s · PyAV %s (FFmpeg %s) · Qt %s", APP_NAME, __version__, av.__version__,
                  getattr(av, "ffmpeg_version_info", "?"), qVersion())
@@ -171,6 +185,7 @@ class MainWindow(QMainWindow):
         dp.proc_amp_edited.connect(self._on_proc_amp_edited)
         dp.reset_neutral_clicked.connect(self._reset_proc_amp)
         dp.audio_device_selected.connect(self._on_audio_device_selected)
+        dp.audio_plug_selected.connect(self._on_audio_plug_selected)
         dp.record_audio_toggled.connect(self._on_record_audio_toggled)
 
         rp = self.record_panel
@@ -337,20 +352,37 @@ class MainWindow(QMainWindow):
     def _refresh_devices(self) -> None:
         try:
             videos = dshow.list_video_devices()
-            audios = dshow.list_audio_devices()
         except DShowError as exc:
             log.error("Could not list capture devices: %s", exc)
-            videos, audios = [], []
+            videos = []
         self.device_panel.set_video_devices([d.name for d in videos], self.settings.video_device)
-        self.device_panel.set_audio_devices([d.name for d in audios], self.settings.audio_device)
-        log.debug("Video devices: %s | audio devices: %s", [d.name for d in videos], [d.name for d in audios])
-        self.device_panel.set_audio_available(
-            False,
-            "Audio recording is not available yet: the Elgato's audio input can't be opened through "
-            "DirectShow on this PC (see README, “Audio”). Video recording is unaffected.",
-        )
+        log.debug("Video devices: %s", [d.name for d in videos])
+        self._refresh_audio_inputs()
+
+    def _refresh_audio_inputs(self) -> None:
+        """Re-scan audio inputs.  Runs before video opens (see audio._sd for why)."""
+        if self.audio is not None:  # never re-scan PortAudio under an open stream
+            return
+        try:
+            self._audio_inputs = audio_io.list_inputs(refresh=True)
+        except Exception as exc:  # PortAudio couldn't start: no audio at all
+            self._audio_inputs = []
+            log.warning("Audio inputs can't be listed: %s", exc)
+        items = [("Automatic: the Elgato's line input", AUTO)] + [(d.label, d.key) for d in self._audio_inputs]
+        self.device_panel.set_audio_inputs(items, self.settings.audio_device)
+        if any(d.is_elgato for d in self._audio_inputs):
+            note = ("Line-level sound into the Elgato's red/white RCA jacks, captured with Windows kernel "
+                    "streaming (the usual Windows audio routes can't open this card). There's only sound "
+                    "while the video is live.")
+        else:
+            note = "The Elgato's audio input wasn't found (is the card plugged in?). Other inputs still work."
+        self.device_panel.set_audio_available(bool(self._audio_inputs), note)
+        log.debug("Audio inputs: %s", [d.key for d in self._audio_inputs])
 
     def _start_capture(self) -> None:
+        if self._stuck_capture is not None:  # the driver still holds the old stream; see _stop_capture
+            self._restart_pending = True
+            return
         s = self.settings
         std = STANDARDS[s.video_standard]
         self.preview.set_frame_geometry(std.width, std.height, float(std.pixel_aspect))
@@ -365,31 +397,70 @@ class MainWindow(QMainWindow):
         )
         self.capture.start()
 
-    def _stop_capture(self) -> None:
+    def _stop_capture(self) -> bool:
+        """Stop the capture thread.  Returns False if the driver never let it finish.
+
+        Why this can happen: the thread's last act is asking the driver to stop
+        streaming, and this Elgato driver can hang in that call — seen when a PAL
+        stream was closed while an NTSC camera was connected.  Nothing in a user
+        program can interrupt a call stuck inside a driver; unplugging the card
+        makes the driver cancel it.  Until then, opening the device again would
+        only fail, so we wait for the stuck thread instead (_check_stuck_capture).
+        """
         capture, self.capture = self.capture, None
         if capture is None:
-            return
+            return True
         capture.set_record_sink(None)
         capture.stop()
         capture.join(timeout=5.0)
-        if capture.is_alive():
-            log.warning("The capture thread is slow to stop (the driver may be stuck); continuing anyway.")
+        if not capture.is_alive():
+            return True
+        self._stuck_capture = capture
+        self._capture_gen += 1  # ignore anything the stuck thread reports later
+        self.stuck_timer.start()
+        message = ("The Elgato's driver stopped responding while closing the video stream. Unplug the "
+                   "Elgato, wait 5 seconds and plug it back in; capture restarts by itself.")
+        self._capture_state, self._capture_message = CaptureState.FAILED, message
+        self.device_panel.set_capture_status(CaptureState.FAILED, message)
+        log.error(message)
+        self._update_status_bar()
+        self._update_hud()
+        return False
+
+    def _check_stuck_capture(self) -> None:
+        """Once a second while the driver is stuck: has unplugging the card freed it?"""
+        stuck = self._stuck_capture
+        if stuck is not None and stuck.is_alive():
+            return
+        self._stuck_capture = None
+        self.stuck_timer.stop()
+        log.info("The capture driver has let go of the old stream.")
+        if self._restart_pending or self.capture is None:
+            self._restart_pending = False
+            self._apply_decoder_standard()
+            self._start_capture()
 
     def _restart_capture(self, why: str) -> None:
         if self.recorder is not None:
             log.warning("Stop recording before changing the device, input or standard.")
             return
         log.info(why)
-        self._stop_capture()
+        stopped = self._stop_capture()
         self._latest = self._shown = None
         self._stats = None
         self._signal_locked = None
         self.device_panel.set_signal(None)
         self.preview.clear_image()
+        if not stopped:
+            self._restart_pending = True  # _check_stuck_capture restarts once the driver lets go
+            return
         self._apply_decoder_standard()
         self._start_capture()
 
     def _reconnect_now(self) -> None:
+        if self._stuck_capture is not None:
+            log.warning("Still waiting for the Elgato's driver to let go: unplug the card and plug it back in.")
+            return
         if self.capture is not None:
             log.info("Retrying the device now…")
             self.capture.retry_now()
@@ -560,6 +631,8 @@ class MainWindow(QMainWindow):
 
     def _apply_decoder_standard(self) -> None:
         """Make the card's decoder chip match the selected standard before streaming."""
+        if self._stuck_capture is not None:  # don't poke a driver that's already stuck
+            return
         std = STANDARDS[self.settings.video_standard]
         if not self._ensure_controls() or self.controls is None or not self.controls.has_decoder:
             return
@@ -599,6 +672,10 @@ class MainWindow(QMainWindow):
     # Recording
     # ======================================================================
 
+    def is_live(self) -> bool:
+        """True while live video is arriving."""
+        return self._capture_state == CaptureState.RUNNING
+
     def toggle_recording(self) -> None:
         if self._recording_finishing:
             return
@@ -632,20 +709,38 @@ class MainWindow(QMainWindow):
             f"({VIDEO_INPUT_LABELS[s.video_input]}, {std.name}). "
             + ("Proc amp at neutral." if not off else f"Proc amp NOT neutral: {self._describe_off_neutral(off)}.")
         )
-        recorder = RecordThread(path, std, on_finished=self.bridge.recording_finished.emit, comment=comment)
+        # Audio first (video is already live, so the card's audio path is on).  The
+        # file only gets an audio track if the input really opened.
+        audio = self._open_audio() if s.audio_enabled else None
+        if audio is not None:
+            comment += f" Audio: {audio.device.label}, {AUDIO_PLUG_LABELS[audio.plug]}, {audio.rate} Hz."
+        recorder = RecordThread(
+            path, std, on_finished=self.bridge.recording_finished.emit, comment=comment,
+            audio_rate=audio.rate if audio else None, audio_channels=audio.channels if audio else 2,
+            av_offset=s.av_sync_offset_ms / 1000,
+        )
         recorder.start()
         recorder.opened.wait(5.0)
         if recorder.error or not recorder.opened.is_set():
             recorder.stop()
+            if audio is not None:
+                audio.stop()
             self._warn("Recording didn't start", recorder.error or "Timed out creating the file.")
             return
 
         self.recorder = recorder
         self._stop_reason = None
         self.capture.set_record_sink(recorder)
+        if audio is not None:
+            audio.sink = recorder.offer_audio
+            self.audio = audio
+            self._audio_progress = (audio.frames, time.monotonic())
+            self._audio_warned = False
         self.record_panel.set_recording(True, path)
+        self.record_panel.update_audio(None, "starting…" if audio else ("off" if not s.audio_enabled else "no input"))
         self.device_panel.set_device_controls_enabled(False, "Stop recording to change the device, input or standard.")
-        log.info("● Recording to %s", path)
+        log.info("● Recording to %s%s", path,
+                 f" with sound from {audio.device.label}, {AUDIO_PLUG_LABELS[audio.plug]}" if audio else " (video only)")
         self._last_disk_check = 0.0
         self._tick()
 
@@ -655,13 +750,66 @@ class MainWindow(QMainWindow):
             return
         if self.capture is not None:
             self.capture.set_record_sink(None)
-        recorder.stop()  # writes what's queued, then finalises; _on_recording_finished follows
+        # The audio input keeps running: the recorder still needs the sound that's in
+        # its buffers.  It's stopped in _on_recording_finished, once the file is closed.
+        recorder.stop()
         self._recording_finishing = True
         self._stop_reason = reason if unexpected else None  # reported (in red) once the file is closed
         self.record_panel.set_recording(True, finishing=True)
 
+    def _open_audio(self) -> AudioCapture | None:
+        """Start the audio input.  Its samples go nowhere until a recorder takes them."""
+        want = self.settings.audio_device
+        for attempt in (1, 2):
+            device = audio_io.find_input(want, self._audio_inputs)
+            if device is not None:
+                capture = AudioCapture(device, plug=self.settings.audio_plug)
+                try:
+                    capture.start()
+                except AudioError as exc:
+                    if attempt == 2:
+                        log.error("Recording video only: %s", exc)
+                        return None
+                    log.info("Audio input didn't open (%s); re-scanning and trying again.", exc)
+                else:
+                    if want not in (AUTO, device.key):
+                        log.warning("Audio input “%s” isn't connected; using %s instead.",
+                                    want.split("::")[-1], device.label)
+                    return capture
+            elif attempt == 2:
+                log.warning("Recording video only: no audio input found (is the Elgato plugged in?).")
+                return None
+            self._refresh_audio_inputs()  # the card may have been replugged since the last scan
+        return None
+
+    def _stop_audio(self) -> None:
+        audio, self.audio = self.audio, None
+        if audio is not None:
+            audio.stop()
+            if audio.overflows:
+                log.warning("The audio input had to discard sound %d time(s) because the PC was too busy; "
+                            "those moments are silent in the recording.", audio.overflows)
+
+    def _update_audio_meter(self, now: float) -> None:
+        audio = self.audio
+        if audio is None:
+            return
+        level = audio.level_dbfs()
+        self.record_panel.update_audio(level, "silence" if math.isinf(level) else f"{level:.0f} dB")
+        frames, since = self._audio_progress
+        if audio.frames != frames:
+            self._audio_progress = (audio.frames, now)
+        elif now - since > 2.0 and not self._audio_warned:
+            self._audio_warned = True
+            log.warning("No sound is arriving from %s; the recording continues without it.", audio.device.label)
+        rate = audio.measured_rate()
+        if rate and abs(rate / audio.rate - 1) > 0.01 and not self._audio_warned:
+            self._audio_warned = True
+            log.warning("The audio input delivers %.0f samples/s, not %d; sound may drift.", rate, audio.rate)
+
     @Slot(object)
     def _on_recording_finished(self, result: RecordingResult) -> None:
+        self._stop_audio()
         recorder, self.recorder = self.recorder, None
         if recorder is not None:
             recorder.join(timeout=5.0)
@@ -673,6 +821,12 @@ class MainWindow(QMainWindow):
         size = result.path.stat().st_size if result.path.exists() else 0
         summary = (f"{result.path.name} — {format_duration(result.duration)}, "
                    f"{result.frames_written} frames, {format_bytes(size)}")
+        if result.audio_seconds is not None:
+            summary += f", sound {format_duration(result.audio_seconds)}"
+            if result.audio_gaps:
+                log.warning("%d gap(s) in the sound of %s were filled with silence.", result.audio_gaps,
+                            result.path.name)
+            log.debug("Audio sync: %d single-sample adjustments in %s", result.audio_adjustments, result.path.name)
         if result.frames_dropped:
             log.error("%d frames were LOST from %s because the disk couldn't keep up.",
                       result.frames_dropped, result.path.name)
@@ -701,6 +855,7 @@ class MainWindow(QMainWindow):
             duration = recorder.duration
             rate = size / duration if duration >= 2 else None
             self.record_panel.update_recording(duration, size, rate, recorder.frames_dropped, recorder.device_gaps)
+            self._update_audio_meter(now)
             lost = f"   ⚠ {recorder.frames_dropped} LOST" if recorder.frames_dropped else ""
             self.preview.rec_text = f"● REC  {format_duration(duration)}   {format_bytes(size)}{lost}"
             self.preview.update()
@@ -748,14 +903,31 @@ class MainWindow(QMainWindow):
     def _on_standard_selected(self, key: str) -> None:
         if key == self.settings.video_standard:
             return
+        current, new = STANDARDS[self.settings.video_standard], STANDARDS[key]
+        if self._capture_state == CaptureState.RUNNING and self._signal_locked:
+            # A locked picture means the source really is the current standard.  Leaving
+            # it loses the picture, and closing a mismatched stream later is exactly
+            # what hung this driver (PAL stream + NTSC camera).  So ask first.
+            answer = QMessageBox.question(
+                self, "Switch TV standard?",
+                f"The card is locked to a {current.key} picture right now, so your source is {current.key}.\n\n"
+                f"Switching to {new.key} will lose the picture. With this driver, switching back afterwards "
+                f"can also freeze it until you unplug and replug the Elgato.\n\nSwitch to {new.key} anyway?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.device_panel.select_standard(self.settings.video_standard)
+                return
         self.settings.video_standard = key
         self._restart_capture(f"Switching the video standard to {STANDARDS[key].name}.")
 
-    def _on_audio_device_selected(self, name: str) -> None:
-        self.settings.audio_device = name
+    def _on_audio_device_selected(self, key: str) -> None:
+        self.settings.audio_device = key or AUTO
+
+    def _on_audio_plug_selected(self, key: str) -> None:
+        self.settings.audio_plug = key
 
     def _on_record_audio_toggled(self, on: bool) -> None:
-        self.settings.record_audio = on
+        self.settings.audio_enabled = on
 
     def _on_output_dir_changed(self, folder: str) -> None:
         self.settings.output_dir = folder
@@ -951,7 +1123,11 @@ class MainWindow(QMainWindow):
             recorder.join(timeout=30.0)
             log.info("Saved %s", recorder.path)
             self.recorder = None
-        self._stop_capture()
+        self._stop_audio()  # after the recorder: it takes the sound still in the buffers
+        self.stuck_timer.stop()
+        if not self._stop_capture() or self._stuck_capture is not None:
+            log.warning("The Elgato's driver is stuck, so Windows can't finish closing the app until you "
+                        "unplug the Elgato (or restart the PC).")
         self._close_controls()
         self._save_layout()
         try:

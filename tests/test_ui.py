@@ -67,9 +67,60 @@ class MainWindowTests(unittest.TestCase):
         self.press(Qt.Key.Key_Space)
         self.assertFalse(self.win.preview.frozen)
 
+    def test_audio_plug_choice_is_remembered(self):
+        combo = self.win.device_panel.audio_plug_combo
+        self.assertEqual(combo.currentData(), "both")  # stereo unless chosen otherwise
+        combo.activated.emit(combo.findData("red"))
+        self.assertEqual(self.win.settings.audio_plug, "red")
+
+    def test_recordings_take_sound_from_the_chosen_plug(self):
+        self.win.settings.audio_plug = "white"
+        device = mock.Mock(key="Windows WDM-KS::Analog Audio In ()")
+        with mock.patch("vintagecam.ui.main_window.audio_io.find_input", return_value=device), \
+                mock.patch("vintagecam.ui.main_window.AudioCapture") as capture:
+            self.win._open_audio()
+        capture.assert_called_once_with(device, plug="white")
+
     def test_record_key_without_video_does_not_start_a_recording(self):
         self.press(Qt.Key.Key_R)
         self.assertIsNone(self.win.recorder)
+
+    def test_stuck_driver_waits_for_replug_then_restarts(self):
+        """A capture thread stuck in the driver must not be piled on; restart once it's freed."""
+
+        class StuckCapture:
+            alive = True
+
+            def set_record_sink(self, sink): pass
+            def stop(self): pass
+            def join(self, timeout=None): pass
+            def is_alive(self): return self.alive
+
+        stuck = StuckCapture()
+        started = []
+        self.win.capture = stuck
+        with mock.patch.object(self.win, "_apply_decoder_standard"), \
+                mock.patch.object(MainWindow, "_start_capture", lambda win: started.append(True)):
+            self.win._restart_capture("test")
+            self.assertIs(self.win._stuck_capture, stuck)
+            self.assertIn("Unplug", self.win._capture_message)
+            self.win._check_stuck_capture()
+            self.assertEqual(started, [], "must not reopen while the driver still holds the old stream")
+            stuck.alive = False  # the user replugged the card; the driver let go
+            self.win._check_stuck_capture()
+            self.assertEqual(started, [True])
+            self.assertIsNone(self.win._stuck_capture)
+
+    def test_switching_away_from_a_locked_picture_asks_first(self):
+        from vintagecam.capture import CaptureState
+        from PySide6.QtWidgets import QMessageBox
+
+        self.win._capture_state, self.win._signal_locked = CaptureState.RUNNING, True
+        with mock.patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No), \
+                mock.patch.object(self.win, "_restart_capture") as restart:
+            self.win._on_standard_selected("PAL")
+        restart.assert_not_called()
+        self.assertEqual(self.win.settings.video_standard, "NTSC")
 
     def test_a_frame_is_drawn_in_true_colour(self):
         rgb = np.zeros((480, 720, 3), np.uint8)
