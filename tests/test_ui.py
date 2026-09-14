@@ -81,6 +81,19 @@ class MainWindowTests(unittest.TestCase):
             self.win._open_audio()
         capture.assert_called_once_with(device, plug="white")
 
+    def test_a_finished_recording_gets_an_mp4_viewing_copy(self):
+        path = Path(tempfile.gettempdir()) / "vintagecam_test_recording.mkv"
+        result = mock.Mock(path=path, frames_written=10, frames_dropped=0, device_gaps=0, duration=0.3, error=None,
+                           audio_seconds=None)
+        with mock.patch.object(self.win.exports, "add") as add:
+            self.win._on_recording_finished(result)
+            add.assert_called_once_with([path], "auto")
+            add.reset_mock()
+            self.win.record_panel.export_after_check.setChecked(False)  # the user turns it off
+            self.assertFalse(self.win.settings.export_after_recording)
+            self.win._on_recording_finished(result)
+            add.assert_not_called()
+
     def test_record_key_without_video_does_not_start_a_recording(self):
         self.press(Qt.Key.Key_R)
         self.assertIsNone(self.win.recorder)

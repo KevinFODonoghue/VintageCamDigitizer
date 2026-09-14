@@ -114,6 +114,8 @@ class Settings:
     av_sync_offset_ms: float = 0.0
     low_disk_warning_gb: float = 20.0  # warn below this much free space
     low_disk_stop_gb: float = 2.0  # stop recording cleanly below this
+    #: Also make an MP4 viewing copy (export.py) after each recording.
+    export_after_recording: bool = True
 
     # --- preview --------------------------------------------------------------
     show_grid: bool = True  # on by default, like the old ffplay drawgrid/drawbox overlay

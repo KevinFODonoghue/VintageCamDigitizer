@@ -80,7 +80,15 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--screenshot", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--quit-after", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--auto-record", type=float, help=argparse.SUPPRESS)  # record N s once live, then quit
+    parser.add_argument("--export", nargs="+", type=Path, metavar="RECORDING",
+                        help="make an MP4 viewing copy of each recording (next to it), then exit")
+    parser.add_argument("--field-order", default="auto",
+                        help="with --export: auto (measure it), tff or bff")
     args = parser.parse_args(argv)
+    if args.export:  # no window and no log file: the app runs this as a child process for each export
+        from .export import main as export_main
+
+        return export_main([*map(str, args.export), "--field-order", args.field_order])
 
     log_dir = _setup_logging()
     _install_crash_hooks()

@@ -1,6 +1,7 @@
 """
-The Recording panel: the big record button, where files go, and live numbers
-(elapsed time, file size, data rate, free disk space, dropped frames).
+The Recording panel: the big record button, where files go, live numbers
+(elapsed time, file size, data rate, free disk space, dropped frames), and MP4
+viewing copies.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -33,6 +35,9 @@ class RecordPanel(QWidget):
     record_clicked = Signal()
     output_dir_changed = Signal(str)
     prefix_changed = Signal(str)
+    export_clicked = Signal()
+    export_cancel_clicked = Signal()
+    export_after_toggled = Signal(bool)
 
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -111,13 +116,53 @@ class RecordPanel(QWidget):
         dform.addRow("Time left", self.left_value)
         layout.addWidget(disk)
 
+        layout.addWidget(self._build_export_box(settings))
+
         layout.addWidget(muted_label(
             "Video: FFV1 version 3 lossless (16 slices, per-slice CRC, every frame a keyframe), "
-            "4:2:2, in Matroska (.mkv). Audio: uncompressed 16-bit PCM, 48 kHz, stereo or mono (Device panel)."
-            "Plays in VLC. About 30–45 GB per hour."
+            "4:2:2, in Matroska (.mkv). Audio: uncompressed 16-bit PCM, 48 kHz, stereo or mono (Device panel). "
+            "Plays in VLC; for other players, make an MP4 viewing copy. About 30–45 GB per hour."
         ))
         layout.addStretch(1)
         self.set_recording(False)
+
+    def _build_export_box(self, settings: Settings) -> QGroupBox:
+        box = QGroupBox("Viewing copies (MP4)")
+        column = QVBoxLayout(box)
+        self.export_after_check = QCheckBox("Make one after each recording")
+        self.export_after_check.setChecked(settings.export_after_recording)
+        self.export_after_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.export_after_check.toggled.connect(self.export_after_toggled)
+        self.export_button = QPushButton("Export recordings…")
+        self.export_button.setToolTip("Make MP4 viewing copies of recordings you choose (Ctrl+E)")
+        self.export_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.export_button.clicked.connect(self.export_clicked)
+        self.export_cancel_button = QPushButton("Cancel")
+        self.export_cancel_button.setToolTip("Stop exporting. The unfinished copy is deleted; recordings are untouched.")
+        self.export_cancel_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.export_cancel_button.clicked.connect(self.export_cancel_clicked)
+        self.export_cancel_button.hide()
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.export_button)
+        buttons.addWidget(self.export_cancel_button)
+        buttons.addStretch(1)
+        self.export_progress = QProgressBar()
+        self.export_progress.setRange(0, 1000)
+        self.export_progress.setTextVisible(False)
+        self.export_progress.setFixedHeight(10)
+        self.export_progress.hide()
+        self.export_status = muted_label()
+        self.export_status.hide()
+        column.addWidget(self.export_after_check)
+        column.addLayout(buttons)
+        column.addWidget(self.export_progress)
+        column.addWidget(self.export_status)
+        column.addWidget(muted_label(
+            "H.264 video and AAC sound in an .mp4 next to the recording: plays in Windows Media Player, "
+            "on phones and in browsers. Deinterlaced to 59.94 frames a second with square pixels, and much "
+            "smaller. The .mkv stays the lossless original."
+        ))
+        return box
 
     # -- updates from the main window ------------------------------------------------
 
@@ -160,6 +205,15 @@ class RecordPanel(QWidget):
     def update_disk(self, free_bytes: int | None, seconds_left: float | None) -> None:
         self.free_value.setText(format_bytes(free_bytes))
         self.left_value.setText(format_time_left(seconds_left))
+
+    def set_export_status(self, text: str, fraction: object, running: bool) -> None:
+        """What the exporter is doing.  ``fraction`` (0–1) moves the bar; None leaves it where it is."""
+        self.export_status.setText(text)
+        self.export_status.setVisible(bool(text))
+        self.export_progress.setVisible(running)
+        if isinstance(fraction, (int, float)):
+            self.export_progress.setValue(int(max(0.0, min(1.0, float(fraction))) * 1000))
+        self.export_cancel_button.setVisible(running)
 
     def show_banner(self, text: str | None, level: str = "warn") -> None:
         if not text:

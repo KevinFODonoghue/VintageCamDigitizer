@@ -22,7 +22,7 @@ from pathlib import Path
 import av
 from PySide6.QtCore import QByteArray, QObject, Qt, QTimer, QUrl, Signal, Slot, qVersion
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices, QKeySequence
-from PySide6.QtWidgets import QDockWidget, QFrame, QLabel, QMainWindow, QMessageBox, QScrollArea, QWidget
+from PySide6.QtWidgets import QDockWidget, QFileDialog, QFrame, QLabel, QMainWindow, QMessageBox, QScrollArea, QWidget
 
 from .. import APP_NAME, __version__, dshow
 from .. import audio as audio_io
@@ -38,6 +38,7 @@ from ..render import PreviewRenderer
 from ..units import GB, format_bytes, format_duration, format_time_left
 from ..video_format import STANDARDS, VideoStandard, standard_for_analog_flag
 from .device_panel import DevicePanel
+from .export_queue import ExportQueue
 from .log_panel import LogPanel, QtLogHandler
 from .preview import PreviewWidget
 from .record_panel import RecordPanel
@@ -190,6 +191,12 @@ class MainWindow(QMainWindow):
 
         rp = self.record_panel
         rp.record_clicked.connect(self.toggle_recording)
+        rp.export_clicked.connect(self._choose_exports)
+        rp.export_after_toggled.connect(self._on_export_after_toggled)
+        self.exports = ExportQueue(self)
+        self.exports.status_changed.connect(rp.set_export_status)
+        self.exports.finished_one.connect(self._on_export_finished)
+        rp.export_cancel_clicked.connect(lambda: self.exports.cancel_all())
         rp.output_dir_changed.connect(self._on_output_dir_changed)
         rp.prefix_changed.connect(self._on_prefix_changed)
 
@@ -248,10 +255,12 @@ class MainWindow(QMainWindow):
                                        tip="Hold the picture on screen. Recording is not affected.")
         self.act_reconnect = self._action("Reconnect now", "Ctrl+R", lambda *_: self._reconnect_now())
         self.act_open_folder = self._action("Open recordings folder", "Ctrl+O", lambda *_: self._open_output_folder())
+        self.act_export = self._action("Export MP4 viewing copies…", "Ctrl+E", lambda *_: self._choose_exports(),
+                                       tip="Make .mp4 copies of recordings that play in any player")
         self.act_quit = self._action("Quit", "Ctrl+Q", lambda *_: self.close())
         m_capture.addActions([self.act_record, self.act_freeze])
         m_capture.addSeparator()
-        m_capture.addActions([self.act_reconnect, self.act_open_folder])
+        m_capture.addActions([self.act_reconnect, self.act_open_folder, self.act_export])
         m_capture.addSeparator()
         m_capture.addAction(self.act_quit)
 
@@ -842,6 +851,8 @@ class MainWindow(QMainWindow):
             self._warn("Recording stopped", f"{self._stop_reason}\n\nSaved: {summary}", logging.ERROR)
         else:
             log.info("■ Saved %s", summary)
+            if self.settings.export_after_recording and result.frames_written:
+                self.exports.add([result.path], self.settings.field_order)
         self._update_hud()
 
     def _tick(self) -> None:
@@ -1078,6 +1089,7 @@ class MainWindow(QMainWindow):
             ("F11 / Esc", "Full screen / leave full screen"),
             ("Ctrl+R", "Reconnect to the device now"),
             ("Ctrl+O", "Open the recordings folder"),
+            ("Ctrl+E", "Export MP4 viewing copies of recordings"),
             ("Ctrl+1 / 2 / 3", "Show or hide the Device, Recording and Log panels"),
             ("Ctrl+Q", "Quit"),
         ]
@@ -1097,6 +1109,24 @@ class MainWindow(QMainWindow):
         )
 
     # ======================================================================
+    # MP4 viewing copies (export.py does the work, in a child process)
+    # ======================================================================
+
+    def _choose_exports(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choose recordings to export as MP4", self.settings.output_dir, "Recordings (*.mkv)"
+        )
+        if paths:
+            self.exports.add([Path(p) for p in paths], self.settings.field_order)
+
+    def _on_export_after_toggled(self, on: bool) -> None:
+        self.settings.export_after_recording = on
+
+    def _on_export_finished(self, source: Path, ok: bool, message: str) -> None:
+        if not ok and message:  # a cancelled export isn't a problem
+            self._warn("Export failed", f"No MP4 was made from {source.name}: {message}", logging.ERROR)
+
+    # ======================================================================
     # Shutdown
     # ======================================================================
 
@@ -1108,6 +1138,17 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        if self.exports.running:
+            answer = QMessageBox.question(
+                self, "Export in progress",
+                f"An MP4 viewing copy is still being made ({self.exports.describe()}).\n\n"
+                "Stop it and quit? The unfinished copy is deleted. The recording itself is safe, and you can "
+                "export it again later (Capture → Export MP4 viewing copies).",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.exports.cancel_all(wait=True)
         if self.screenshot_on_close is not None:
             self.grab().save(str(self.screenshot_on_close))
             log.info("Screenshot saved to %s", self.screenshot_on_close)

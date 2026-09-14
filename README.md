@@ -357,6 +357,37 @@ seems early or late overall, set `av_sync_offset_ms` in settings.json
   offered 48 kHz stereo S16. It was only shown to open there, not to contain
   sound.
 
+## Viewing copies (MP4)
+
+Recordings are FFV1, a lossless archival format. VLC plays them, but Windows'
+Media Player, phones and browsers don't ("encoded in Unknown format"). So the
+app also makes a **viewing copy**: H.264 video and AAC sound in an `.mp4`, next
+to the recording and with the same name. The `.mkv` is only read, never
+changed.
+
+- **Make one after each recording** (Recording panel) is on by default. The
+  copy is made in the background while you carry on.
+- **Export recordings…** (or Capture → Export MP4 viewing copies, Ctrl+E) makes
+  copies of the recordings you pick, one after another. **Cancel** stops and
+  deletes the unfinished copy.
+- From a terminal, for one file or many:
+  `.\.venv\Scripts\python main.py --export capture_20260911_001409.mkv`
+
+What the copy is:
+
+- **Deinterlaced** to 59.94 frames a second (FFmpeg's bwdif): each field
+  becomes a frame, so motion is as smooth as on a TV and there are no comb
+  lines. Which field comes first is measured from motion in the recording.
+  When the picture is too still to tell, the standard's usual order is used;
+  then it makes no visible difference. An order chosen in View → Bob field
+  order overrides the measurement.
+- **Square pixels:** 654 × 480, the picture the preview shows with "Correct
+  pixel aspect".
+- **Quality:** H.264 High profile at CRF 18, hard to tell from the original;
+  sound is AAC at 192 kb/s (stereo) or 128 kb/s (mono).
+- It's made in a separate, low-priority process (`main.py --export`), so a
+  capture or recording running at the same time gets the computer first.
+
 ## Verified on the target machine
 
 Measured with `tools/hardware_check.py` and the tests, on 2026-09-10:
@@ -378,6 +409,7 @@ Measured with `tools/hardware_check.py` and the tests, on 2026-09-10:
 | Camera signal lost | "NO SIGNAL" shown within a second; cleared by itself when the signal returned |
 | Sound (kernel streaming) | ~48,000 samples/s arriving (48 kHz). Recordings have no gaps or overflows, even through a deliberate 0.3 s freeze of the program, and the sound ends within 1 ms of the picture |
 | Sound from the camera (2026-09-11, `tools/camera_sound_check.py`) | test tones picked up by the camera's microphone come back at the right pitch (999.96 and 440.01 Hz), 41–57 dB above the surrounding sound, equally on both channels, without clipping |
+| MP4 viewing copy (2026-09-11) | a 6.6 s recording (33 MB) became a 2.7 MB .mp4 in 1.4 s: H.264 High, 654 × 480, 59.94 fps (all 382 fields), AAC stereo, BT.601 colour tags |
 | Other Windows audio routes | DirectShow, waveIn, DirectSound and WASAPI (shared and exclusive) all refuse this card's audio |
 
 ## Tests
