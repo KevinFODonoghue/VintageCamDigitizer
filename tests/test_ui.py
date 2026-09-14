@@ -94,6 +94,39 @@ class MainWindowTests(unittest.TestCase):
             self.win._on_recording_finished(result)
             add.assert_not_called()
 
+    def test_pot_assist_measures_only_while_its_panel_is_showing(self):
+        self.assertFalse(self.win.analysis.enabled)  # the panel starts behind the Recording tab
+        self.win._toggle_pot_dock()
+        app.processEvents()
+        self.assertFalse(self.win.pot_dock.visibleRegion().isEmpty())  # really on screen now
+        self.assertTrue(self.win.analysis.enabled)
+        self.assertTrue(self.win.preview.overlays.pot_boxes)
+        self.win.record_dock.raise_()  # as clicking the Recording tab does: Pot assist goes behind it
+        app.processEvents()
+        self.assertFalse(self.win.analysis.enabled)
+        self.assertFalse(self.win.preview.overlays.pot_boxes)
+        self.win._toggle_pot_dock()  # back in front…
+        app.processEvents()
+        self.assertTrue(self.win.analysis.enabled)
+        self.win.pot_panel.boxes_check.setChecked(False)
+        self.assertFalse(self.win.preview.overlays.pot_boxes)
+        self.win._toggle_pot_dock()  # …and closed
+        app.processEvents()
+        self.assertFalse(self.win.analysis.enabled)
+
+    def test_pot_assist_remembers_what_it_learns(self):
+        from vintagecam.analysis import PotStatus
+
+        self.win._on_pot_status(PotStatus("shading_red", None, 1.0, learned=("RT313", -1), measured_deadband=0.3))
+        self.assertEqual(self.win.settings.pot_polarity, {"RT313": -1})
+        self.assertEqual(self.win.settings.pot_deadbands, {"shading_red": 0.3})
+
+    def test_choosing_what_to_adjust_shows_its_pots(self):
+        self.win._on_pot_mode_selected("focus")
+        self.assertEqual(self.win.settings.pot_mode, "focus")
+        pots = [self.win.pot_panel._rows[name][0].text() for name in ("H saw", "H para", "V saw", "V para")]
+        self.assertEqual(pots, ["RT305", "RT306", "RT307", "RT308"])
+
     def test_record_key_without_video_does_not_start_a_recording(self):
         self.press(Qt.Key.Key_R)
         self.assertIsNone(self.win.recorder)

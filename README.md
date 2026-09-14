@@ -388,6 +388,41 @@ What the copy is:
 - It's made in a separate, low-priority process (`main.py --export`), so a
   capture or recording running at the same time gets the computer first.
 
+## Pot Assist (Phase 2)
+
+The first Phase 2 instrument. It tells you which of the camera's shading or
+dynamic-focus pots to turn next, and which way, to bring the errors to zero. It
+measures five sample boxes (centre, left, right, top, bottom; the panel can
+draw them on the picture) and turns them into four terms, one per pot:
+
+| Term | What it compares | Red shading | Blue shading | Focus |
+|---|---|---|---|---|
+| H saw | right minus left (a tilt) | RT313 | RT309 | RT305 |
+| H para | the sides against the centre | RT314 | RT310 | RT306 |
+| V saw | bottom minus top (a tilt) | RT315 | RT311 | RT307 |
+| V para | top and bottom against the centre | RT316 | RT312 | RT308 |
+
+- Open it with **Ctrl+4** (or its tab next to Recording) and pick what you're
+  adjusting. For shading, point the camera at an evenly lit white card that
+  fills the frame; for focus, at a chart with fine detail everywhere.
+- **Measure noise** first: two readings a few seconds apart, nothing touched.
+  Twice their biggest difference becomes the tolerance; inside it, a term shows
+  OK.
+- **Learn** on a row teaches the app which way that pot works: it takes a
+  reading, you turn the pot a little clockwise and press **Done**, and it reads
+  again. Learned directions and tolerances are kept in settings.json.
+- Then follow **Next**: it names the pot and which way to turn it. A parabola
+  (para) term is only suggested once the tilt (saw) on its axis is inside the
+  tolerance.
+- Readings average the last 90 frames (3 seconds), so give a pot you've turned
+  a moment to show its effect.
+
+Shading readings are code values away from neutral grey (Cr − 128 for red,
+Cb − 128 for blue). Focus readings are fine-detail energy (the variance of a
+Laplacian), so compare them only with each other. The measuring runs on its own
+thread, and only while the panel is on screen. It's a port of `pot_metrics.py`;
+`vintagecam/pot_assist.py` explains what changed from it and why.
+
 ## Verified on the target machine
 
 Measured with `tools/hardware_check.py` and the tests, on 2026-09-10:

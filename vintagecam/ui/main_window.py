@@ -26,6 +26,7 @@ from PySide6.QtWidgets import QDockWidget, QFileDialog, QFrame, QLabel, QMainWin
 
 from .. import APP_NAME, __version__, dshow
 from .. import audio as audio_io
+from ..analysis import AnalysisThread, PotStatus
 from ..audio import AUTO, AudioCapture, AudioError, AudioInput
 from ..capture import CaptureRequest, CaptureState, CaptureStats, CaptureThread
 from ..config import (AUDIO_PLUG_LABELS, DEINTERLACE_MODES, TYPICAL_GB_PER_HOUR, VIDEO_INPUT_LABELS, Settings,
@@ -40,6 +41,7 @@ from ..video_format import STANDARDS, VideoStandard, standard_for_analog_flag
 from .device_panel import DevicePanel
 from .export_queue import ExportQueue
 from .log_panel import LogPanel, QtLogHandler
+from .pot_panel import PotPanel
 from .preview import PreviewWidget
 from .record_panel import RecordPanel
 from .theme import ERROR_RED, MUTED, OK_GREEN, WARN_AMBER
@@ -77,6 +79,7 @@ class WorkerBridge(QObject):
     capture_state = Signal(int, object, str, object)
     capture_stats = Signal(int, object)
     recording_finished = Signal(object)
+    pot_status = Signal(object)
 
 
 class MainWindow(QMainWindow):
@@ -116,6 +119,7 @@ class MainWindow(QMainWindow):
         self._audio_inputs: list[AudioInput] = []
         self._audio_progress = (0, 0.0)  # (frames seen, when they last increased)
         self._audio_warned = False
+        self._pot_on_screen = False  # tracked from the dock's visibilityChanged (see _on_pot_dock_visibility)
 
         self.bridge = WorkerBridge(self)
         queued = Qt.ConnectionType.QueuedConnection
@@ -123,6 +127,12 @@ class MainWindow(QMainWindow):
         self.bridge.capture_state.connect(self._on_capture_state, queued)
         self.bridge.capture_stats.connect(self._on_capture_stats, queued)
         self.bridge.recording_finished.connect(self._on_recording_finished, queued)
+        self.bridge.pot_status.connect(self._on_pot_status, queued)
+        # Phase 2's analysis thread: Pot Assist measures there, never on the GUI thread.
+        self.analysis = AnalysisThread(self.bridge.pot_status.emit, mode=settings.pot_mode,
+                                       deadband=settings.pot_deadbands.get(settings.pot_mode),
+                                       polarity=settings.pot_polarity)
+        self.analysis.start()
 
         self.setWindowTitle(APP_NAME)
         self.resize(1440, 900)
@@ -168,11 +178,15 @@ class MainWindow(QMainWindow):
         self.device_panel = DevicePanel(self.settings)
         self.record_panel = RecordPanel(self.settings)
         self.log_panel = LogPanel(self._log_dir)
+        self.pot_panel = PotPanel(self.settings.pot_mode, self.settings.show_pot_boxes)
         self._log_handler.bridge.record.connect(self.log_panel.append)
 
         self.device_dock = self._make_dock("Device", self.device_panel, Qt.DockWidgetArea.RightDockWidgetArea, "deviceDock")
         self.record_dock = self._make_dock("Recording", self.record_panel, Qt.DockWidgetArea.RightDockWidgetArea, "recordDock")
         self.log_dock = self._make_dock("Log", self.log_panel, Qt.DockWidgetArea.BottomDockWidgetArea, "logDock")
+        self.pot_dock = self._make_dock("Pot assist", self.pot_panel, Qt.DockWidgetArea.RightDockWidgetArea, "potDock")
+        self.tabifyDockWidget(self.record_dock, self.pot_dock)
+        self.record_dock.raise_()
         self.resizeDocks([self.device_dock], [370], Qt.Orientation.Horizontal)
         self.resizeDocks([self.device_dock, self.record_dock], [640, 380], Qt.Orientation.Vertical)
         self.resizeDocks([self.log_dock], [140], Qt.Orientation.Vertical)
@@ -199,6 +213,15 @@ class MainWindow(QMainWindow):
         rp.export_cancel_clicked.connect(lambda: self.exports.cancel_all())
         rp.output_dir_changed.connect(self._on_output_dir_changed)
         rp.prefix_changed.connect(self._on_prefix_changed)
+
+        pp = self.pot_panel
+        pp.mode_selected.connect(self._on_pot_mode_selected)
+        pp.noise_clicked.connect(self.analysis.measure_noise)
+        pp.learn_clicked.connect(self.analysis.learn)
+        pp.done_clicked.connect(self.analysis.done)
+        pp.cancel_clicked.connect(self.analysis.cancel)
+        pp.boxes_toggled.connect(self._on_pot_boxes_toggled)
+        self.pot_dock.visibilityChanged.connect(self._on_pot_dock_visibility)
 
         self.status_state = QLabel()
         self.status_fps = QLabel()
@@ -319,6 +342,10 @@ class MainWindow(QMainWindow):
             m_view.addAction(act)
             self.addAction(act)
 
+        self.act_pot = self._action("Pot assist panel", "Ctrl+4", lambda *_: self._toggle_pot_dock(),
+                                    tip="Show the Pot Assist panel, or hide it")
+        m_view.addAction(self.act_pot)
+
         m_help = bar.addMenu("&Help")
         m_help.addAction(self._action("Keyboard shortcuts", "F1", lambda *_: self._show_shortcuts()))
         m_help.addAction(self._action("About", "", lambda *_: self._show_about()))
@@ -405,6 +432,7 @@ class MainWindow(QMainWindow):
             on_frame=lambda: self.bridge.frame_ready.emit(gen),
         )
         self.capture.start()
+        self.analysis.set_source(self.capture.analysis_slot)
 
     def _stop_capture(self) -> bool:
         """Stop the capture thread.  Returns False if the driver never let it finish.
@@ -416,6 +444,7 @@ class MainWindow(QMainWindow):
         makes the driver cancel it.  Until then, opening the device again would
         only fail, so we wait for the stuck thread instead (_check_stuck_capture).
         """
+        self.analysis.set_source(None)
         capture, self.capture = self.capture, None
         if capture is None:
             return True
@@ -459,6 +488,7 @@ class MainWindow(QMainWindow):
         self._stats = None
         self._signal_locked = None
         self.device_panel.set_signal(None)
+        self.pot_panel.set_signal(None)
         self.preview.clear_image()
         if not stopped:
             self._restart_pending = True  # _check_stuck_capture restarts once the driver lets go
@@ -666,6 +696,7 @@ class MainWindow(QMainWindow):
             first_reading = self._signal_locked is None
             self._signal_locked = locked
             self.device_panel.set_signal(locked)
+            self.pot_panel.set_signal(locked)
             if not locked:
                 log.warning("NO SIGNAL: the card isn't locked to a picture. Is the camera on and plugged into "
                             "the %s input?", VIDEO_INPUT_LABELS[self.settings.video_input])
@@ -1091,6 +1122,7 @@ class MainWindow(QMainWindow):
             ("Ctrl+O", "Open the recordings folder"),
             ("Ctrl+E", "Export MP4 viewing copies of recordings"),
             ("Ctrl+1 / 2 / 3", "Show or hide the Device, Recording and Log panels"),
+            ("Ctrl+4", "Show the Pot Assist panel, or hide it"),
             ("Ctrl+Q", "Quit"),
         ]
         table = "".join(f"<tr><td style='padding-right:14px'><b>{k}</b></td><td>{v}</td></tr>" for k, v in rows)
@@ -1107,6 +1139,51 @@ class MainWindow(QMainWindow):
             f"<br><br>PyAV {av.__version__} · FFmpeg {getattr(av, 'ffmpeg_version_info', '?')} · Qt {qVersion()}"
             f"<br>Settings: settings.json · Log: {self._log_dir}",
         )
+
+    # ======================================================================
+    # Pot Assist (Phase 2: the analysis thread does the measuring)
+    # ======================================================================
+
+    def _on_pot_status(self, status: PotStatus) -> None:
+        s = self.settings
+        if status.learned is not None:
+            pot, sign = status.learned
+            s.pot_polarity[pot] = sign
+            log.info("Pot Assist: turning %s clockwise %s its reading.", pot, "raises" if sign > 0 else "lowers")
+        if status.measured_deadband is not None:
+            s.pot_deadbands[status.mode] = status.measured_deadband
+            log.info("Pot Assist: the tolerance for %s is %.4g.", status.mode, status.measured_deadband)
+        self.pot_panel.show_status(status)
+
+    def _on_pot_mode_selected(self, mode: str) -> None:
+        s = self.settings
+        s.pot_mode = mode
+        self.pot_panel.set_mode(mode)
+        self.analysis.set_mode(mode, s.pot_deadbands.get(mode), s.pot_polarity)
+
+    def _on_pot_boxes_toggled(self, on: bool) -> None:
+        self.settings.show_pot_boxes = on
+        self._update_pot_boxes()
+
+    def _on_pot_dock_visibility(self, visible: bool) -> None:
+        # Qt's isVisible() stays True for a dock hidden behind another tab, so "on
+        # screen" is tracked from this signal instead.  It fires whenever a tab is
+        # chosen or the dock is shown or hidden, and with the starting state when
+        # the window first opens.
+        self._pot_on_screen = visible
+        self.analysis.set_enabled(visible)  # measure only while the panel is on screen
+        self._update_pot_boxes()
+
+    def _update_pot_boxes(self) -> None:
+        self.preview.overlays.pot_boxes = self.settings.show_pot_boxes and self._pot_on_screen
+        self.preview.update()
+
+    def _toggle_pot_dock(self) -> None:
+        if self._pot_on_screen:
+            self.pot_dock.hide()
+        else:
+            self.pot_dock.show()
+            self.pot_dock.raise_()
 
     # ======================================================================
     # MP4 viewing copies (export.py does the work, in a child process)
@@ -1165,6 +1242,8 @@ class MainWindow(QMainWindow):
             log.info("Saved %s", recorder.path)
             self.recorder = None
         self._stop_audio()  # after the recorder: it takes the sound still in the buffers
+        self.analysis.stop()
+        self.analysis.join(timeout=2.0)
         self.stuck_timer.stop()
         if not self._stop_capture() or self._stuck_capture is not None:
             log.warning("The Elgato's driver is stuck, so Windows can't finish closing the app until you "
