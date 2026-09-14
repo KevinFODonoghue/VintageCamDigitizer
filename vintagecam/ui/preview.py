@@ -217,7 +217,7 @@ class PreviewWidget(QWidget):
                 labels.append((p.transform().map(QPointF(mx + iw * frac, my)), name, color))
 
         if ov.pot_grid:
-            # The pot meter's grid: each cell's average colour is compared with white.
+            # The pot meter's grid: each cell's average colour is compared with its target (white, or the phone photo).
             pen = QPen(POT_GRID_COLOR)
             pen.setCosmetic(True)
             p.setPen(pen)

@@ -13,8 +13,8 @@ from vintagecam.video_format import NTSC
 
 H, W = 480, 720
 X, Y = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
-PATTERN = ((X - 360) / 360) ** 2 + ((Y - 240) / 240) ** 2  # 0 in the centre, 2 in the corners
-PATTERN -= PATTERN.mean()
+RAW = ((X - 360) / 360) ** 2 + ((Y - 240) / 240) ** 2  # 0 in the centre, 2 in the corners
+PATTERN = RAW - RAW.mean()
 RNG = np.random.default_rng(7)
 
 
@@ -37,12 +37,13 @@ def pot_frame(p: float, best: float = 0.3, base: float = 240.0, amount: float = 
     return rgb_to_uyvy(rgb + RNG.normal(0, 2.0, rgb.shape))
 
 
-def phone_photo(room_tint: float, width: int = 660, height: int = 484, exposure: float = 0.8,
-                base: float = 240.0) -> np.ndarray:
-    """The same card as a phone sees it: square pixels, the camera picture's shape, its own exposure."""
-    x, y = np.meshgrid(np.linspace(-1, 1, width), np.linspace(-1, 1, height))
-    pattern = x ** 2 + y ** 2
-    pattern -= pattern.mean()
+def phone_photo(room_tint: float, width: int = 668, exposure: float = 0.8, base: float = 240.0) -> np.ndarray:
+    """The same card as a phone sees it: square pixels, its own exposure, framed on the grid's area."""
+    height = round(width / pm.GRID_ASPECT)
+    u = np.linspace((pm.GRID_LEFT * W - 360) / 360, (pm.GRID_RIGHT * W - 360) / 360, width)
+    v = np.linspace((pm.GRID_TOP * H - 240) / 240, (pm.GRID_BOTTOM * H - 240) / 240, height)
+    uu, vv = np.meshgrid(u, v)
+    pattern = uu ** 2 + vv ** 2 - RAW.mean()  # the same places on the card as the camera's pattern
     return exposure * np.stack([base + room_tint * pattern, base - room_tint * pattern,
                                 np.full_like(pattern, base)], axis=-1)
 
@@ -52,13 +53,23 @@ def measured(*frames: np.ndarray) -> np.ndarray:
 
 
 class Grid(unittest.TestCase):
-    def test_the_grid_covers_the_picture_except_a_thin_border(self):
+    def test_the_grid_covers_the_picture_but_not_the_blanking(self):
         xs, ys = pm.grid_edges(480, 720)
         self.assertEqual((len(xs), len(ys)), (pm.GRID_COLUMNS + 1, pm.GRID_ROWS + 1))
-        self.assertEqual((xs[0], xs[-1], ys[0], ys[-1]), (14, 706, 10, 470))
+        self.assertEqual((xs[0], xs[-1], ys[0], ys[-1]), (22, 716, 0, 480))
         cell_w_on_screen = (xs[-1] - xs[0]) / pm.GRID_COLUMNS * NTSC.pixel_aspect  # NTSC pixels are 10/11 wide
         cell_h = (ys[-1] - ys[0]) / pm.GRID_ROWS
-        self.assertAlmostEqual(cell_w_on_screen / cell_h, 1.0, delta=0.05)  # square cells on the screen
+        self.assertAlmostEqual(cell_w_on_screen / cell_h, 1.0, delta=0.02)  # square cells on the screen
+
+    def test_the_elgatos_blanking_never_gets_into_a_cell(self):
+        card = solid(230, 230, 230)
+        framed = card.copy()
+        luma = framed[:, 1::2]  # the Elgato's line, as measured in every recording:
+        luma[:, :18] = 1  # blanking, about 0 (below video black)…
+        luma[:, 18] = 30  # …the picture's edge rising…
+        luma[:, 19] = 250  # …and overshooting,
+        luma[:, 718], luma[:, 719] = 200, 40  # and a spike at the end of the line
+        np.testing.assert_array_equal(pm.cell_colours(framed), pm.cell_colours(card))
 
     def test_each_cell_holds_its_average_colour(self):
         colours = pm.cell_colours(solid(200, 150, 100))

@@ -404,16 +404,18 @@ the frame, open the panel with **Ctrl+4** (or its tab next to Recording), and:
    next one.
 
 How it judges: the picture is split into a 20 × 15 grid (square cells on a 4:3
-picture; the corners count as much as the centre, and only a thin border at the
-very edge, the capture's black blanking, is left out). Each cell's average
-colour is compared with what it should be: plain white at the card's own
-brightness, or your phone photo of the card (below). Tint and unevenness count;
-the light level and the iris don't. Turning a pot moves every cell's colour
-roughly in proportion to how far it's turned, so the two end measurements give
-each cell a straight path, and the meter works out where along it the whole
-grid comes closest to its target. The light is green within 3% of the pot's
-travel of that point. If the best point lies past one end, that end is the best
-the pot can do, and the panel says so.
+picture; the corners count as much as the centre). The grid covers the picture
+itself: every line from the Elgato starts with 18 columns of black blanking
+(cells that took them in would read about 13% too dark), so the grid starts
+just after the picture's edge, and it stops before a spike at the very end of
+each line. Each cell's average colour is compared with what it should be: plain
+white at the card's own brightness, or your phone photo of the card (below).
+Tint and unevenness count; the light level and the iris don't. Turning a pot
+moves every cell's colour roughly in proportion to how far it's turned, so the
+two end measurements give each cell a straight path, and the meter works out
+where along it the whole grid comes closest to its target. The light is green
+within 3% of the pot's travel of that point. If the best point lies past one
+end, that end is the best the pot can do, and the panel says so.
 
 **Zeroing with a phone photo.** Outside a studio, a white card rarely looks
 pure white: room light is warm or cool, and brighter on one side. A phone

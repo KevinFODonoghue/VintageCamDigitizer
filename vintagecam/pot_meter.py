@@ -11,8 +11,18 @@ average colour is compared with what it should be: an even, neutral white as
 bright as the card is on average, or, after zeroing with a phone photo, that
 photo's colour for the cell.  How far the whole grid is from its target is one
 number, the root-mean-square of every cell's distance from it, in RGB code
-values (0–255).  A thin border at the very edge is left out: that's the
-capture's black blanking, not the card.
+values (0–255).
+
+**Where the grid sits.**  The Elgato's 720-pixel line isn't all picture.  In
+every recording of the camera, whatever it showed, columns 0–17 are line
+blanking (black: they read 1–20), the picture's edge rises at column 18 and
+overshoots at 19, and the last two columns carry a spike from the end of the
+line.  A grid starting at column 14 took 5 of those columns into each left-hand
+cell, and those cells read 12–13% too dark (on a white card, about 30 code
+values), with a sixth of their tint lost.  So the grid starts at column 22,
+where the edge has settled (the cells then read within 0.6% of the picture),
+and stops at 716.  Every one of the 480 lines is picture, so the grid runs the
+full height.
 
 **Why white at the card's own brightness, not pure white (255)?**  Measured
 against pure white, a card that isn't lit to exactly full white is off by the
@@ -52,22 +62,27 @@ import numpy as np
 from .color import BLACK_Y, KB, KR, MAX_C, MIN_C, NEUTRAL_C, WHITE_Y, split_uyvy
 
 GRID_COLUMNS, GRID_ROWS = 20, 15  # square cells on a 4:3 picture
-MARGIN = 0.02  # the thin border left out at each edge: blanking, not the card
+#: Where the grid sits in the frame, as fractions of its width and height: clear
+#: of the Elgato's line blanking and the picture's edge (columns 0–21 of 720) and
+#: of the spike at the end of the line (716–719).  Every line is picture, so it
+#: runs the full height (see "Where the grid sits").
+GRID_LEFT, GRID_RIGHT = 22 / 720, 716 / 720
+GRID_TOP, GRID_BOTTOM = 0.0, 1.0
+#: The grid area's shape on screen, which phone photos are cropped to.  (NTSC
+#: pixels are 10/11 as wide as they are tall; PAL's 12/11 on 576 lines comes out
+#: the same.)
+GRID_ASPECT = (GRID_RIGHT - GRID_LEFT) * 720 * (10 / 11) / ((GRID_BOTTOM - GRID_TOP) * 480)
 MEASURE_FRAMES = 30  # each end is measured over a second of frames
 LIVE_FRAMES = 10  # the live reading averages a third of a second: steady, yet quick to follow a turn
 TOLERANCE = 0.03  # green within 3% of the pot's travel of the best position
 MIN_EFFECT = 1.0  # a pot that changes the grid less than this (RMS, code values) can't be judged
 DARK_WARNING = 120.0  # an average below this: the camera probably isn't looking at a lit white card
-#: The camera picture's shape on screen: 720 × 480 with NTSC's 10/11-wide pixels
-#: (PAL's 720 × 576 with 12/11-wide pixels comes out the same).
-PICTURE_ASPECT = 15 / 11
 
 
 def grid_edges(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
     """The grid's cell boundaries in pixels: GRID_COLUMNS + 1 x positions and GRID_ROWS + 1 y positions."""
-    mx, my = round(width * MARGIN), round(height * MARGIN)
-    xs = np.round(np.linspace(mx, width - mx, GRID_COLUMNS + 1)).astype(int)
-    ys = np.round(np.linspace(my, height - my, GRID_ROWS + 1)).astype(int)
+    xs = np.round(np.linspace(GRID_LEFT * width, GRID_RIGHT * width, GRID_COLUMNS + 1)).astype(int)
+    ys = np.round(np.linspace(GRID_TOP * height, GRID_BOTTOM * height, GRID_ROWS + 1)).astype(int)
     return xs, ys
 
 
@@ -101,11 +116,12 @@ def cell_colours(uyvy: np.ndarray) -> np.ndarray:
     return _to_rgb(_cell_means(y, xs, ys), _cell_means(cb, xs // 2, ys), _cell_means(cr, xs // 2, ys))
 
 
-def reference_from_rgb(rgb: np.ndarray, aspect: float = PICTURE_ASPECT) -> np.ndarray:
+def reference_from_rgb(rgb: np.ndarray, aspect: float = GRID_ASPECT) -> np.ndarray:
     """A phone photo (height, width, 3; RGB 0–255) → the colour each grid cell should have: (rows, columns, 3).
 
-    The photo is cropped, centred, to the camera picture's shape, then averaged
-    over the same grid.  Raises ValueError (with a reason to show) if it can't serve.
+    The photo should show what the camera's picture shows.  It's cropped, centred,
+    to the grid area's shape and split into the same 20 × 15 cells.  Raises
+    ValueError (with a reason to show) if it can't serve.
     """
     height, width = rgb.shape[:2]
     if height > width:
@@ -116,7 +132,9 @@ def reference_from_rgb(rgb: np.ndarray, aspect: float = PICTURE_ASPECT) -> np.nd
     else:
         keep = round(width / aspect)
         rgb = rgb[(height - keep) // 2:(height - keep) // 2 + keep]
-    xs, ys = grid_edges(rgb.shape[0], rgb.shape[1])
+    height, width = rgb.shape[:2]
+    xs = np.round(np.linspace(0, width, GRID_COLUMNS + 1)).astype(int)
+    ys = np.round(np.linspace(0, height, GRID_ROWS + 1)).astype(int)
     reference = np.stack([_cell_means(rgb[..., k], xs, ys) for k in range(3)], axis=-1)
     if reference.mean() < 20:
         raise ValueError("it's almost black. Photograph the lit white card")
