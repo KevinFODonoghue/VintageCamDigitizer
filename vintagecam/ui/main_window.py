@@ -34,6 +34,7 @@ from ..config import (AUDIO_PLUG_LABELS, DEINTERLACE_MODES, TYPICAL_GB_PER_HOUR,
 from ..dshow import DShowError, ProcAmp, ProcAmpRange
 from ..errors import CaptureError
 from ..frames import CapturedFrame
+from ..pot_meter import reference_from_rgb
 from ..recorder import RecordingResult, RecordThread, free_disk_bytes, make_recording_path
 from ..render import PreviewRenderer
 from ..units import GB, format_bytes, format_duration, format_time_left
@@ -41,7 +42,7 @@ from ..video_format import STANDARDS, VideoStandard, standard_for_analog_flag
 from .device_panel import DevicePanel
 from .export_queue import ExportQueue
 from .log_panel import LogPanel, QtLogHandler
-from .pot_panel import PotPanel
+from .pot_panel import PotPanel, load_photo
 from .preview import PreviewWidget
 from .record_panel import RecordPanel
 from .theme import ERROR_RED, MUTED, OK_GREEN, WARN_AMBER
@@ -128,10 +129,8 @@ class MainWindow(QMainWindow):
         self.bridge.capture_stats.connect(self._on_capture_stats, queued)
         self.bridge.recording_finished.connect(self._on_recording_finished, queued)
         self.bridge.pot_status.connect(self._on_pot_status, queued)
-        # Phase 2's analysis thread: Pot Assist measures there, never on the GUI thread.
-        self.analysis = AnalysisThread(self.bridge.pot_status.emit, mode=settings.pot_mode,
-                                       deadband=settings.pot_deadbands.get(settings.pot_mode),
-                                       polarity=settings.pot_polarity)
+        # Phase 2's analysis thread: the pot meter measures there, never on the GUI thread.
+        self.analysis = AnalysisThread(self.bridge.pot_status.emit)
         self.analysis.start()
 
         self.setWindowTitle(APP_NAME)
@@ -140,6 +139,8 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._restore_layout()
         self._apply_view_settings()
+        if settings.pot_reference_photo:
+            self._use_reference_photo(Path(settings.pot_reference_photo), quiet=True)
 
         self.tick_timer = QTimer(self)
         self.tick_timer.setInterval(500)
@@ -178,13 +179,13 @@ class MainWindow(QMainWindow):
         self.device_panel = DevicePanel(self.settings)
         self.record_panel = RecordPanel(self.settings)
         self.log_panel = LogPanel(self._log_dir)
-        self.pot_panel = PotPanel(self.settings.pot_mode, self.settings.show_pot_boxes)
+        self.pot_panel = PotPanel(self.settings.show_pot_grid)
         self._log_handler.bridge.record.connect(self.log_panel.append)
 
         self.device_dock = self._make_dock("Device", self.device_panel, Qt.DockWidgetArea.RightDockWidgetArea, "deviceDock")
         self.record_dock = self._make_dock("Recording", self.record_panel, Qt.DockWidgetArea.RightDockWidgetArea, "recordDock")
         self.log_dock = self._make_dock("Log", self.log_panel, Qt.DockWidgetArea.BottomDockWidgetArea, "logDock")
-        self.pot_dock = self._make_dock("Pot assist", self.pot_panel, Qt.DockWidgetArea.RightDockWidgetArea, "potDock")
+        self.pot_dock = self._make_dock("Pot meter", self.pot_panel, Qt.DockWidgetArea.RightDockWidgetArea, "potDock")
         self.tabifyDockWidget(self.record_dock, self.pot_dock)
         self.record_dock.raise_()
         self.resizeDocks([self.device_dock], [370], Qt.Orientation.Horizontal)
@@ -215,12 +216,11 @@ class MainWindow(QMainWindow):
         rp.prefix_changed.connect(self._on_prefix_changed)
 
         pp = self.pot_panel
-        pp.mode_selected.connect(self._on_pot_mode_selected)
-        pp.noise_clicked.connect(self.analysis.measure_noise)
-        pp.learn_clicked.connect(self.analysis.learn)
-        pp.done_clicked.connect(self.analysis.done)
-        pp.cancel_clicked.connect(self.analysis.cancel)
-        pp.boxes_toggled.connect(self._on_pot_boxes_toggled)
+        pp.measure_clicked.connect(self.analysis.measure)
+        pp.reset_clicked.connect(self.analysis.reset)
+        pp.grid_toggled.connect(self._on_pot_grid_toggled)
+        pp.photo_load_clicked.connect(self._choose_reference_photo)
+        pp.photo_clear_clicked.connect(self._clear_reference_photo)
         self.pot_dock.visibilityChanged.connect(self._on_pot_dock_visibility)
 
         self.status_state = QLabel()
@@ -342,8 +342,8 @@ class MainWindow(QMainWindow):
             m_view.addAction(act)
             self.addAction(act)
 
-        self.act_pot = self._action("Pot assist panel", "Ctrl+4", lambda *_: self._toggle_pot_dock(),
-                                    tip="Show the Pot Assist panel, or hide it")
+        self.act_pot = self._action("Pot meter panel", "Ctrl+4", lambda *_: self._toggle_pot_dock(),
+                                    tip="Show the pot meter, or hide it")
         m_view.addAction(self.act_pot)
 
         m_help = bar.addMenu("&Help")
@@ -1122,7 +1122,7 @@ class MainWindow(QMainWindow):
             ("Ctrl+O", "Open the recordings folder"),
             ("Ctrl+E", "Export MP4 viewing copies of recordings"),
             ("Ctrl+1 / 2 / 3", "Show or hide the Device, Recording and Log panels"),
-            ("Ctrl+4", "Show the Pot Assist panel, or hide it"),
+            ("Ctrl+4", "Show the pot meter, or hide it"),
             ("Ctrl+Q", "Quit"),
         ]
         table = "".join(f"<tr><td style='padding-right:14px'><b>{k}</b></td><td>{v}</td></tr>" for k, v in rows)
@@ -1141,29 +1141,45 @@ class MainWindow(QMainWindow):
         )
 
     # ======================================================================
-    # Pot Assist (Phase 2: the analysis thread does the measuring)
+    # Pot meter (Phase 2: the analysis thread does the measuring)
     # ======================================================================
 
     def _on_pot_status(self, status: PotStatus) -> None:
-        s = self.settings
-        if status.learned is not None:
-            pot, sign = status.learned
-            s.pot_polarity[pot] = sign
-            log.info("Pot Assist: turning %s clockwise %s its reading.", pot, "raises" if sign > 0 else "lowers")
-        if status.measured_deadband is not None:
-            s.pot_deadbands[status.mode] = status.measured_deadband
-            log.info("Pot Assist: the tolerance for %s is %.4g.", status.mode, status.measured_deadband)
         self.pot_panel.show_status(status)
 
-    def _on_pot_mode_selected(self, mode: str) -> None:
-        s = self.settings
-        s.pot_mode = mode
-        self.pot_panel.set_mode(mode)
-        self.analysis.set_mode(mode, s.pot_deadbands.get(mode), s.pot_polarity)
+    def _choose_reference_photo(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a phone photo of the white card", str(Path.home() / "Pictures"),
+            "Photos (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff);;All files (*)",
+        )
+        if path:
+            self._use_reference_photo(Path(path))
 
-    def _on_pot_boxes_toggled(self, on: bool) -> None:
-        self.settings.show_pot_boxes = on
-        self._update_pot_boxes()
+    def _use_reference_photo(self, path: Path, quiet: bool = False) -> None:
+        """Zero the pot meter on this photo: it aims for how the card really looks, not plain white."""
+        try:
+            reference = reference_from_rgb(load_photo(path))
+        except (OSError, ValueError) as exc:
+            if quiet:  # at start-up: the remembered photo has gone or changed
+                log.warning("The pot meter's photo %s can't be used any more (%s); aiming for plain white.",
+                            path, exc)
+            else:
+                self._warn("Couldn't use that photo", f"{path.name}: {exc}.")
+            self._clear_reference_photo()
+            return
+        self.settings.pot_reference_photo = str(path)
+        self.analysis.set_reference(reference)
+        self.pot_panel.show_reference(path.name, reference)
+        log.info("Pot meter: aiming for how the card looks in %s, instead of plain white.", path.name)
+
+    def _clear_reference_photo(self) -> None:
+        self.settings.pot_reference_photo = ""
+        self.analysis.set_reference(None)
+        self.pot_panel.show_reference(None, None)
+
+    def _on_pot_grid_toggled(self, on: bool) -> None:
+        self.settings.show_pot_grid = on
+        self._update_pot_grid()
 
     def _on_pot_dock_visibility(self, visible: bool) -> None:
         # Qt's isVisible() stays True for a dock hidden behind another tab, so "on
@@ -1172,10 +1188,10 @@ class MainWindow(QMainWindow):
         # the window first opens.
         self._pot_on_screen = visible
         self.analysis.set_enabled(visible)  # measure only while the panel is on screen
-        self._update_pot_boxes()
+        self._update_pot_grid()
 
-    def _update_pot_boxes(self) -> None:
-        self.preview.overlays.pot_boxes = self.settings.show_pot_boxes and self._pot_on_screen
+    def _update_pot_grid(self) -> None:
+        self.preview.overlays.pot_grid = self.settings.show_pot_grid and self._pot_on_screen
         self.preview.update()
 
     def _toggle_pot_dock(self) -> None:

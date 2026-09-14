@@ -25,14 +25,14 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QMouseEvent, QPa
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ..color import luma_to_display, staircase_levels
-from ..pot_assist import regions as pot_regions
+from ..pot_meter import grid_edges as pot_grid_edges
 
 GRID_COLOR = QColor(255, 255, 255, 90)  # white at 35%, as in the old ffplay drawgrid
 CROSS_LINE_COLOR = QColor(255, 220, 0, 140)  # thin full-length lines
 CROSS_BOLD_COLOR = QColor(255, 45, 45)  # bold centre cross
 ACTION_SAFE_COLOR = QColor(90, 220, 130, 220)
 TITLE_SAFE_COLOR = QColor(255, 170, 60, 220)
-POT_BOX_COLOR = QColor(80, 200, 255, 230)
+POT_GRID_COLOR = QColor(80, 200, 255, 150)
 HUD_BG = QColor(0, 0, 0, 165)
 HUD_FG = QColor(225, 225, 225)
 REC_BG = QColor(183, 28, 28, 230)
@@ -47,7 +47,7 @@ class Overlays:
     crosshair: bool = False
     safe_areas: bool = False
     staircase: bool = False
-    pot_boxes: bool = False
+    pot_grid: bool = False
 
 
 class PreviewWidget(QWidget):
@@ -180,7 +180,7 @@ class PreviewWidget(QWidget):
 
     def _draw_overlays(self, p: QPainter, target: QRectF) -> None:
         ov = self.overlays
-        if not (ov.grid or ov.crosshair or ov.safe_areas or ov.staircase or ov.pot_boxes):
+        if not (ov.grid or ov.crosshair or ov.safe_areas or ov.staircase or ov.pot_grid):
             return
         iw, ih = float(self._frame_size.width()), float(self._frame_size.height())
         sx, sy = target.width() / iw, target.height() / ih
@@ -216,17 +216,16 @@ class PreviewWidget(QWidget):
                 # Label in the top-right inside corner (top-left is where the info box sits).
                 labels.append((p.transform().map(QPointF(mx + iw * frac, my)), name, color))
 
-        if ov.pot_boxes:
-            # Pot Assist's five sample boxes (centre, left, right, top, bottom): exactly
-            # the pixels its readings come from.
-            pen = QPen(POT_BOX_COLOR)
+        if ov.pot_grid:
+            # The pot meter's grid: each cell's average colour is compared with white.
+            pen = QPen(POT_GRID_COLOR)
             pen.setCosmetic(True)
-            pen.setWidth(2)
             p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            for name, (x0, y0, x1, y1) in pot_regions(int(ih), int(iw)).items():
-                p.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
-                labels.append((p.transform().map(QPointF(x1, y0)), name, POT_BOX_COLOR))
+            xs, ys = pot_grid_edges(int(ih), int(iw))
+            for x in xs:
+                p.drawLine(QPointF(x, ys[0]), QPointF(x, ys[-1]))
+            for y in ys:
+                p.drawLine(QPointF(xs[0], y), QPointF(xs[-1], y))
 
         if ov.crosshair:
             cx, cy = iw / 2, ih / 2

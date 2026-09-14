@@ -11,9 +11,10 @@ and resets the capture card's own picture controls so they can't quietly
 "correct" the camera behind your back.
 
 > **Status: Phase 1 is complete.** That covers the live preview, overlays,
-> lossless recording and the device panel.
-> **Phase 2 is next:** the measuring instruments (vectorscope, waveform
-> monitor, the live numeric readout, and a histogram). See [Roadmap](#roadmap).
+> lossless recording and the device panel. Sound recording and MP4 viewing
+> copies have been added since.
+> **Phase 2 has started** with the pot meter. Still to come: the vectorscope,
+> waveform monitor, live numeric readout and histogram. See [Roadmap](#roadmap).
 
 ---
 
@@ -69,10 +70,11 @@ The full notes are in [docs/SETUP.md](docs/SETUP.md). In short:
 | **Picture** (centre) | The live feed with overlays. Top left: status (live, frames per second, standard, input). Top right: `● REC` while recording. Warnings appear top centre. |
 | **Device** (right) | The capture device, input (Composite / S-Video), TV standard, signal lock, and the **proc amp** (the card's own brightness, contrast, saturation and hue). |
 | **Recording** (right) | The big record button, elapsed time, file size, data rate, free disk space and time left, dropped frames, and the audio level. |
+| **Pot meter** (right, a tab beside Recording) | Tells you when a pot is at its best position: see [Pot meter](#pot-meter-phase-2). |
 | **Log** (bottom) | Everything that happens, with a timestamp. Warnings are amber and errors red. Nothing fails silently. A full debug log goes to `logs/vintagecam.log`. |
 | **Status bar** | Capture state, measured fps, the app's display lag, and any frames dropped by the device. |
 
-Panels can be hidden (Ctrl+1/2/3), dragged or floated. The layout is remembered.
+Panels can be hidden (Ctrl+1/2/3/4), dragged or floated. The layout is remembered.
 
 ## Keyboard shortcuts
 
@@ -94,6 +96,8 @@ because you'll have one hand inside the camera.
 | **F11** / **Esc** | Full screen / leave full screen |
 | **Ctrl+R** | Reconnect to the device now |
 | **Ctrl+O** | Open the recordings folder |
+| **Ctrl+E** | Export MP4 viewing copies of recordings |
+| **Ctrl+4** | Show or hide the pot meter |
 | **F1** | Show this list |
 
 Phase 2 will add **V** (vectorscope), **W** (waveform) and **H** (hold reading).
@@ -388,40 +392,48 @@ What the copy is:
 - It's made in a separate, low-priority process (`main.py --export`), so a
   capture or recording running at the same time gets the computer first.
 
-## Pot Assist (Phase 2)
+## Pot meter (Phase 2)
 
-The first Phase 2 instrument. It tells you which of the camera's shading or
-dynamic-focus pots to turn next, and which way, to bring the errors to zero. It
-measures five sample boxes (centre, left, right, top, bottom; the panel can
-draw them on the picture) and turns them into four terms, one per pot:
+Tells you when a pot is at its best position, for any pot, without needing to
+know what the pot does. Point the camera at an evenly lit white card that fills
+the frame, open the panel with **Ctrl+4** (or its tab next to Recording), and:
 
-| Term | What it compares | Red shading | Blue shading | Focus |
-|---|---|---|---|---|
-| H saw | right minus left (a tilt) | RT313 | RT309 | RT305 |
-| H para | the sides against the centre | RT314 | RT310 | RT306 |
-| V saw | bottom minus top (a tilt) | RT315 | RT311 | RT307 |
-| V para | top and bottom against the centre | RT316 | RT312 | RT308 |
+1. Turn the pot fully clockwise and press **Measure CW**.
+2. Turn it fully anticlockwise and press **Measure CCW**.
+3. Turn it until the light goes **green**. **New pot** starts again for the
+   next one.
 
-- Open it with **Ctrl+4** (or its tab next to Recording) and pick what you're
-  adjusting. For shading, point the camera at an evenly lit white card that
-  fills the frame; for focus, at a chart with fine detail everywhere.
-- **Measure noise** first: two readings a few seconds apart, nothing touched.
-  Twice their biggest difference becomes the tolerance; inside it, a term shows
-  OK.
-- **Learn** on a row teaches the app which way that pot works: it takes a
-  reading, you turn the pot a little clockwise and press **Done**, and it reads
-  again. Learned directions and tolerances are kept in settings.json.
-- Then follow **Next**: it names the pot and which way to turn it. A parabola
-  (para) term is only suggested once the tilt (saw) on its axis is inside the
-  tolerance.
-- Readings average the last 90 frames (3 seconds), so give a pot you've turned
-  a moment to show its effect.
+How it judges: the picture is split into a 20 × 15 grid (square cells on a 4:3
+picture; the corners count as much as the centre, and only a thin border at the
+very edge, the capture's black blanking, is left out). Each cell's average
+colour is compared with what it should be: plain white at the card's own
+brightness, or your phone photo of the card (below). Tint and unevenness count;
+the light level and the iris don't. Turning a pot moves every cell's colour
+roughly in proportion to how far it's turned, so the two end measurements give
+each cell a straight path, and the meter works out where along it the whole
+grid comes closest to its target. The light is green within 3% of the pot's
+travel of that point. If the best point lies past one end, that end is the best
+the pot can do, and the panel says so.
 
-Shading readings are code values away from neutral grey (Cr − 128 for red,
-Cb − 128 for blue). Focus readings are fine-detail energy (the variance of a
-Laplacian), so compare them only with each other. The measuring runs on its own
-thread, and only while the panel is on screen. It's a port of `pot_metrics.py`;
-`vintagecam/pot_assist.py` explains what changed from it and why.
+**Zeroing with a phone photo.** Outside a studio, a white card rarely looks
+pure white: room light is warm or cool, and brighter on one side. A phone
+corrects for that far better than a 1984 camera. Photograph the card with your
+phone from where the camera sits, in landscape, framed like the camera's
+picture, and load it with **Load phone photo…**. The meter then aims each cell
+at the photo's colour there (scaled to the camera's brightness, so the phone's
+exposure doesn't matter) instead of at plain white. JPEG and PNG work; if your
+phone saves HEIC, share or export the photo as a JPEG. **Use plain white** goes
+back. The photo is remembered between sessions.
+
+- A pot that hardly changes the colours or their evenness can't be judged this
+  way; nor can one that only changes the overall brightness (a gain or level
+  pot, say), since brightness isn't compared. The panel says so.
+- If the picture is dark, the panel asks whether the camera is pointed at a
+  well-lit white card.
+- Near the ends of a pot's travel a colour can clip, which bends the straight
+  path a little; then the green spot is approximate.
+- The measuring runs on its own thread, and only while the panel is on screen.
+  `vintagecam/pot_meter.py` explains the details.
 
 ## Verified on the target machine
 

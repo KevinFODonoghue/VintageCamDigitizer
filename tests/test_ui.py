@@ -94,38 +94,71 @@ class MainWindowTests(unittest.TestCase):
             self.win._on_recording_finished(result)
             add.assert_not_called()
 
-    def test_pot_assist_measures_only_while_its_panel_is_showing(self):
+    def test_pot_meter_measures_only_while_its_panel_is_showing(self):
         self.assertFalse(self.win.analysis.enabled)  # the panel starts behind the Recording tab
         self.win._toggle_pot_dock()
         app.processEvents()
         self.assertFalse(self.win.pot_dock.visibleRegion().isEmpty())  # really on screen now
         self.assertTrue(self.win.analysis.enabled)
-        self.assertTrue(self.win.preview.overlays.pot_boxes)
-        self.win.record_dock.raise_()  # as clicking the Recording tab does: Pot assist goes behind it
+        self.assertTrue(self.win.preview.overlays.pot_grid)
+        self.win.record_dock.raise_()  # as clicking the Recording tab does: the pot meter goes behind it
         app.processEvents()
         self.assertFalse(self.win.analysis.enabled)
-        self.assertFalse(self.win.preview.overlays.pot_boxes)
+        self.assertFalse(self.win.preview.overlays.pot_grid)
         self.win._toggle_pot_dock()  # back in front…
         app.processEvents()
         self.assertTrue(self.win.analysis.enabled)
-        self.win.pot_panel.boxes_check.setChecked(False)
-        self.assertFalse(self.win.preview.overlays.pot_boxes)
+        self.win.pot_panel.grid_check.setChecked(False)
+        self.assertFalse(self.win.preview.overlays.pot_grid)
         self.win._toggle_pot_dock()  # …and closed
         app.processEvents()
         self.assertFalse(self.win.analysis.enabled)
 
-    def test_pot_assist_remembers_what_it_learns(self):
+    def test_the_pot_meter_light(self):
         from vintagecam.analysis import PotStatus
 
-        self.win._on_pot_status(PotStatus("shading_red", None, 1.0, learned=("RT313", -1), measured_deadband=0.3))
-        self.assertEqual(self.win.settings.pot_polarity, {"RT313": -1})
-        self.assertEqual(self.win.settings.pot_deadbands, {"shading_red": 0.3})
+        panel = self.win.pot_panel
+        self.assertEqual(panel.light_state, "grey")  # nothing measured yet
+        panel.show_status(PotStatus("", 0.0, True, True, True, 0.31, 0.3))
+        self.assertEqual((panel.light_state, panel.light_text.text()), ("green", "Best position"))
+        panel.show_status(PotStatus("", 0.0, True, True, False, 0.6, 0.3))
+        self.assertEqual(panel.light_state, "red")
+        panel.show_status(PotStatus("cw", 0.4, False, True, None))
+        self.assertEqual(panel.light_state, "grey")
+        self.assertFalse(panel.cw_button.isEnabled())  # no second measurement while one runs
 
-    def test_choosing_what_to_adjust_shows_its_pots(self):
-        self.win._on_pot_mode_selected("focus")
-        self.assertEqual(self.win.settings.pot_mode, "focus")
-        pots = [self.win.pot_panel._rows[name][0].text() for name in ("H saw", "H para", "V saw", "V para")]
-        self.assertEqual(pots, ["RT305", "RT306", "RT307", "RT308"])
+    def test_the_measure_buttons_start_a_measurement(self):
+        import time
+
+        self.win.pot_panel.cw_button.click()
+        deadline = time.monotonic() + 2
+        while self.win.analysis.meter.measuring != "cw" and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        self.assertEqual(self.win.analysis.meter.measuring, "cw")
+
+    def test_a_phone_photo_becomes_the_pot_meters_target(self):
+        import time
+
+        from PySide6.QtGui import QImage
+
+        folder = Path(tempfile.mkdtemp())
+        photo, portrait = folder / "card.png", folder / "portrait.png"
+        for path, (w, h) in ((photo, (450, 330)), (portrait, (330, 450))):
+            rgb = np.ascontiguousarray(np.full((h, w, 3), 230, np.uint8))
+            QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).save(str(path))
+
+        self.win._use_reference_photo(photo)
+        self.assertEqual(self.win.settings.pot_reference_photo, str(photo))
+        self.assertIn("card.png", self.win.pot_panel.reference_label.text())
+        deadline = time.monotonic() + 2
+        while self.win.analysis.meter.reference is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIsNotNone(self.win.analysis.meter.reference)
+
+        self.win._use_reference_photo(portrait)  # refused, with a message; back to plain white
+        self.assertEqual(self.win.settings.pot_reference_photo, "")
+        self.assertIn("Plain white", self.win.pot_panel.reference_label.text())
 
     def test_record_key_without_video_does_not_start_a_recording(self):
         self.press(Qt.Key.Key_R)

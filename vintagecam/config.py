@@ -19,7 +19,6 @@ import tempfile
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-from .pot_assist import MODES as POT_MODES
 from .video_format import STANDARDS
 
 log = logging.getLogger(__name__)
@@ -36,7 +35,7 @@ DEFAULT_VIDEO_DEVICE = "Elgato Video Capture"
 DEFAULT_AUDIO_DEVICE = "Analog Audio In (Elgato Video Capture)"
 
 #: Settings from earlier versions that are now ignored without a warning.
-_OBSOLETE_SETTINGS = {"record_audio"}
+_OBSOLETE_SETTINGS = {"record_audio", "pot_mode", "pot_polarity", "pot_deadbands", "show_pot_boxes"}
 
 #: Crossbar input pins.  A crossbar is the switch inside the card that picks which
 #: physical connector feeds the decoder chip.  The numbers come from
@@ -128,14 +127,9 @@ class Settings:
     field_order: str = "auto"  # one of FIELD_ORDERS; "auto" = the standard's usual order
     fit_to_window: bool = True
     correct_aspect: bool = True
-
-    # --- Pot Assist (pot_assist.py) ----------------------------------------------
-    pot_mode: str = "shading_red"  # one of pot_assist.MODES
-    #: Learned pot directions: pot name → +1 if turning it clockwise raises its reading, −1 if it lowers it.
-    pot_polarity: dict[str, int] = field(default_factory=dict)
-    #: Measured tolerances, one per mode (their units differ: code values for shading, detail for focus).
-    pot_deadbands: dict[str, float] = field(default_factory=dict)
-    show_pot_boxes: bool = True  # draw the five sample boxes on the picture while the panel is open
+    show_pot_grid: bool = True  # draw the pot meter's grid on the picture while its panel is open
+    #: A phone photo of the white card the pot meter aims for instead of plain white ("" = plain white).
+    pot_reference_photo: str = ""
 
     # --- window layout (Qt saveGeometry/saveState, base64) ---------------------
     window_geometry: str = ""
@@ -160,17 +154,6 @@ class Settings:
             reset("deinterlace", f"{self.deinterlace!r} is not one of {list(DEINTERLACE_MODES)}")
         if self.field_order not in FIELD_ORDERS:
             reset("field_order", f"{self.field_order!r} is not one of {list(FIELD_ORDERS)}")
-        if self.pot_mode not in POT_MODES:
-            reset("pot_mode", f"{self.pot_mode!r} is not one of {list(POT_MODES)}")
-        polarity = {pot: sign for pot, sign in self.pot_polarity.items() if type(sign) is int and sign in (1, -1)}
-        if polarity != self.pot_polarity:
-            problems.append("settings.json: pot_polarity values must be 1 or -1; dropped the others")
-            self.pot_polarity = polarity
-        deadbands = {mode: float(value) for mode, value in self.pot_deadbands.items()
-                     if mode in POT_MODES and type(value) in (int, float) and value > 0}
-        if deadbands != self.pot_deadbands:
-            problems.append("settings.json: pot_deadbands needs a positive number per mode; dropped the others")
-            self.pot_deadbands = deadbands
         if not self.video_device.strip():
             reset("video_device", "is empty")
         if not self.output_dir.strip():
