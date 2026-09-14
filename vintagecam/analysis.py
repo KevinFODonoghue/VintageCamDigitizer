@@ -6,9 +6,10 @@ frames.py).  It reads the capture thread's ``analysis_slot``, a mailbox that
 only ever holds the newest frame: if the analysis falls behind, it skips frames
 rather than queueing them, so it can never slow the capture, the recording or
 the preview down.  Nothing here runs on the GUI thread; results go to the GUI
-through a callback (the main window turns it into a Qt signal).
+through callbacks (the main window turns them into Qt signals).
 
-For now it runs one instrument, the pot meter (pot_meter.py).
+It runs two instruments, each only while its panel is on screen: the pot meter
+(pot_meter.py) and the white meter (white_meter.py).
 """
 
 from __future__ import annotations
@@ -25,11 +26,14 @@ import numpy as np
 
 from .frames import CapturedFrame, LatestSlot
 from .pot_meter import DARK_WARNING, LIVE_FRAMES, MEASURE_FRAMES, PotMeter
+from .white_meter import WhiteMeter, WhiteReading
 
 log = logging.getLogger(__name__)
 
-#: Seconds between updates to the GUI.  Five a second is plenty to read.
+#: Seconds between pot meter updates to the GUI.  Five a second is plenty to read.
 STATUS_INTERVAL = 0.2
+#: Seconds between white meter readings: ten a second, so the number follows a pot as it turns.
+WHITE_INTERVAL = 0.1
 
 
 @dataclass(frozen=True)
@@ -50,20 +54,25 @@ class PotStatus:
 
 
 class AnalysisThread(threading.Thread):
-    """Takes the newest frames and runs the pot meter on them, off the GUI thread."""
+    """Takes the newest frames and runs the pot meter and the white meter on them, off the GUI thread."""
 
-    def __init__(self, on_status: Callable[[PotStatus], None], *, live_frames: int = LIVE_FRAMES,
+    def __init__(self, on_status: Callable[[PotStatus], None],
+                 on_white: Callable[[WhiteReading], None] | None = None, *, live_frames: int = LIVE_FRAMES,
                  measure_frames: int = MEASURE_FRAMES) -> None:
         super().__init__(name="AnalysisThread", daemon=True)
         self.meter = PotMeter(live_frames, measure_frames)
+        self.white = WhiteMeter()
         self.processed = 0
         """Frames analysed so far."""
         self._on_status = on_status
+        self._on_white = on_white
         self._source: LatestSlot[CapturedFrame] | None = None
-        self._enabled = False
+        self._pot_enabled = False
+        self._white_enabled = False
         self._commands: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
         self._stop_event = threading.Event()
         self._next_status = 0.0
+        self._next_white = 0.0
 
     # -- called from the GUI thread ------------------------------------------------
 
@@ -71,13 +80,21 @@ class AnalysisThread(threading.Thread):
         """Where frames come from: the running capture's ``analysis_slot`` (None while there's no capture)."""
         self._source = slot  # a single attribute assignment is atomic in Python
 
-    def set_enabled(self, on: bool) -> None:
-        """Analyse only while someone's looking (the pot meter panel is on screen)."""
-        self._enabled = on
+    def set_pot_enabled(self, on: bool) -> None:
+        """Run the pot meter only while someone's looking (its panel is on screen)."""
+        self._pot_enabled = on
 
     @property
-    def enabled(self) -> bool:
-        return self._enabled
+    def pot_enabled(self) -> bool:
+        return self._pot_enabled
+
+    def set_white_enabled(self, on: bool) -> None:
+        """Run the white meter only while its panel is on screen."""
+        self._white_enabled = on
+
+    @property
+    def white_enabled(self) -> bool:
+        return self._white_enabled
 
     def measure(self, end: str) -> None:
         """Measure one end of the pot's travel: "cw" (fully clockwise) or "ccw" (fully anticlockwise)."""
@@ -99,21 +116,44 @@ class AnalysisThread(threading.Thread):
     def run(self) -> None:
         while not self._stop_event.is_set():
             self._handle_commands()
+            if not self._white_enabled:
+                self.white.reset()  # so the first reading after the panel comes back is all new frames
             slot = self._source
-            if slot is None or not self._enabled:
+            if slot is None or not (self._pot_enabled or self._white_enabled):
                 self._stop_event.wait(0.05)
                 continue
             frame = slot.wait_take(0.1)
-            if frame is None or not self._enabled:  # switched off while it waited: drop the frame
+            pot, white = self._pot_enabled, self._white_enabled
+            if frame is None or not (pot or white):  # switched off while it waited: drop the frame
                 continue
-            try:
-                was_measuring = self.meter.measuring
-                self.meter.add(frame.uyvy)
-                self.processed += 1
-                self._report(force=bool(was_measuring) and not self.meter.measuring)  # an end just finished
-            except Exception:  # keep going, but never silently
-                log.exception("The pot meter couldn't analyse a frame")
-                self._stop_event.wait(1.0)  # and don't flood the log
+            if pot:
+                self._run_pot_meter(frame)
+            if white:
+                self._run_white_meter(frame)
+            self.processed += 1
+
+    def _run_pot_meter(self, frame: CapturedFrame) -> None:
+        try:
+            was_measuring = self.meter.measuring
+            self.meter.add(frame.uyvy)
+            self._report(force=bool(was_measuring) and not self.meter.measuring)  # an end just finished
+        except Exception:  # keep going, but never silently
+            log.exception("The pot meter couldn't analyse a frame")
+            self._stop_event.wait(1.0)  # and don't flood the log
+
+    def _run_white_meter(self, frame: CapturedFrame) -> None:
+        try:
+            self.white.add(frame.uyvy)
+            now = time.monotonic()
+            if now < self._next_white:
+                return
+            self._next_white = now + WHITE_INTERVAL
+            reading = self.white.reading()
+            if reading is not None and self._on_white is not None:
+                self._on_white(reading)
+        except Exception:  # keep going, but never silently
+            log.exception("The white meter couldn't analyse a frame")
+            self._stop_event.wait(1.0)  # and don't flood the log
 
     def _handle_commands(self) -> None:
         while True:

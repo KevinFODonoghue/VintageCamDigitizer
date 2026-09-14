@@ -5,6 +5,7 @@ Threads (the brief's architecture):
   CaptureThread (capture.py)   owns the device and fans frames out
   RecordThread  (recorder.py)  writes FFV1, only while recording
   GUI thread    (this file)    shows the newest frame and handles input
+  AnalysisThread (analysis.py) runs the pot meter and white meter
 
 Worker threads never touch widgets.  They call plain Python callbacks, which this
 file turns into Qt signals (``WorkerBridge``); Qt delivers them on the GUI thread.
@@ -39,6 +40,7 @@ from ..recorder import RecordingResult, RecordThread, free_disk_bytes, make_reco
 from ..render import PreviewRenderer
 from ..units import GB, format_bytes, format_duration, format_time_left
 from ..video_format import STANDARDS, VideoStandard, standard_for_analog_flag
+from ..white_meter import WhiteReading
 from .device_panel import DevicePanel
 from .export_queue import ExportQueue
 from .log_panel import LogPanel, QtLogHandler
@@ -46,6 +48,7 @@ from .pot_panel import PotPanel, load_photo
 from .preview import PreviewWidget
 from .record_panel import RecordPanel
 from .theme import ERROR_RED, MUTED, OK_GREEN, WARN_AMBER
+from .white_panel import WhitePanel
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +84,7 @@ class WorkerBridge(QObject):
     capture_stats = Signal(int, object)
     recording_finished = Signal(object)
     pot_status = Signal(object)
+    white_reading = Signal(object)
 
 
 class MainWindow(QMainWindow):
@@ -121,6 +125,7 @@ class MainWindow(QMainWindow):
         self._audio_progress = (0, 0.0)  # (frames seen, when they last increased)
         self._audio_warned = False
         self._pot_on_screen = False  # tracked from the dock's visibilityChanged (see _on_pot_dock_visibility)
+        self._white_on_screen = False  # the same for the white meter
 
         self.bridge = WorkerBridge(self)
         queued = Qt.ConnectionType.QueuedConnection
@@ -129,8 +134,9 @@ class MainWindow(QMainWindow):
         self.bridge.capture_stats.connect(self._on_capture_stats, queued)
         self.bridge.recording_finished.connect(self._on_recording_finished, queued)
         self.bridge.pot_status.connect(self._on_pot_status, queued)
-        # Phase 2's analysis thread: the pot meter measures there, never on the GUI thread.
-        self.analysis = AnalysisThread(self.bridge.pot_status.emit)
+        self.bridge.white_reading.connect(self._on_white_reading, queued)
+        # Phase 2's analysis thread: the pot meter and the white meter measure there, never on the GUI thread.
+        self.analysis = AnalysisThread(self.bridge.pot_status.emit, self.bridge.white_reading.emit)
         self.analysis.start()
 
         self.setWindowTitle(APP_NAME)
@@ -180,13 +186,17 @@ class MainWindow(QMainWindow):
         self.record_panel = RecordPanel(self.settings)
         self.log_panel = LogPanel(self._log_dir)
         self.pot_panel = PotPanel(self.settings.show_pot_grid)
+        self.white_panel = WhitePanel()
         self._log_handler.bridge.record.connect(self.log_panel.append)
 
         self.device_dock = self._make_dock("Device", self.device_panel, Qt.DockWidgetArea.RightDockWidgetArea, "deviceDock")
         self.record_dock = self._make_dock("Recording", self.record_panel, Qt.DockWidgetArea.RightDockWidgetArea, "recordDock")
         self.log_dock = self._make_dock("Log", self.log_panel, Qt.DockWidgetArea.BottomDockWidgetArea, "logDock")
         self.pot_dock = self._make_dock("Pot meter", self.pot_panel, Qt.DockWidgetArea.RightDockWidgetArea, "potDock")
+        self.white_dock = self._make_dock("White meter", self.white_panel, Qt.DockWidgetArea.RightDockWidgetArea,
+                                          "whiteDock")
         self.tabifyDockWidget(self.record_dock, self.pot_dock)
+        self.tabifyDockWidget(self.pot_dock, self.white_dock)
         self.record_dock.raise_()
         self.resizeDocks([self.device_dock], [370], Qt.Orientation.Horizontal)
         self.resizeDocks([self.device_dock, self.record_dock], [640, 380], Qt.Orientation.Vertical)
@@ -222,6 +232,7 @@ class MainWindow(QMainWindow):
         pp.photo_load_clicked.connect(self._choose_reference_photo)
         pp.photo_clear_clicked.connect(self._clear_reference_photo)
         self.pot_dock.visibilityChanged.connect(self._on_pot_dock_visibility)
+        self.white_dock.visibilityChanged.connect(self._on_white_dock_visibility)
 
         self.status_state = QLabel()
         self.status_fps = QLabel()
@@ -344,7 +355,9 @@ class MainWindow(QMainWindow):
 
         self.act_pot = self._action("Pot meter panel", "Ctrl+4", lambda *_: self._toggle_pot_dock(),
                                     tip="Show the pot meter, or hide it")
-        m_view.addAction(self.act_pot)
+        self.act_white = self._action("White meter panel", "Ctrl+5", lambda *_: self._toggle_white_dock(),
+                                      tip="Show the white meter, or hide it")
+        m_view.addActions([self.act_pot, self.act_white])
 
         m_help = bar.addMenu("&Help")
         m_help.addAction(self._action("Keyboard shortcuts", "F1", lambda *_: self._show_shortcuts()))
@@ -489,6 +502,7 @@ class MainWindow(QMainWindow):
         self._signal_locked = None
         self.device_panel.set_signal(None)
         self.pot_panel.set_signal(None)
+        self.white_panel.set_signal(None)
         self.preview.clear_image()
         if not stopped:
             self._restart_pending = True  # _check_stuck_capture restarts once the driver lets go
@@ -697,6 +711,7 @@ class MainWindow(QMainWindow):
             self._signal_locked = locked
             self.device_panel.set_signal(locked)
             self.pot_panel.set_signal(locked)
+            self.white_panel.set_signal(locked)
             if not locked:
                 log.warning("NO SIGNAL: the card isn't locked to a picture. Is the camera on and plugged into "
                             "the %s input?", VIDEO_INPUT_LABELS[self.settings.video_input])
@@ -1123,6 +1138,7 @@ class MainWindow(QMainWindow):
             ("Ctrl+E", "Export MP4 viewing copies of recordings"),
             ("Ctrl+1 / 2 / 3", "Show or hide the Device, Recording and Log panels"),
             ("Ctrl+4", "Show the pot meter, or hide it"),
+            ("Ctrl+5", "Show the white meter, or hide it"),
             ("Ctrl+Q", "Quit"),
         ]
         table = "".join(f"<tr><td style='padding-right:14px'><b>{k}</b></td><td>{v}</td></tr>" for k, v in rows)
@@ -1187,7 +1203,7 @@ class MainWindow(QMainWindow):
         # chosen or the dock is shown or hidden, and with the starting state when
         # the window first opens.
         self._pot_on_screen = visible
-        self.analysis.set_enabled(visible)  # measure only while the panel is on screen
+        self.analysis.set_pot_enabled(visible)  # measure only while the panel is on screen
         self._update_pot_grid()
 
     def _update_pot_grid(self) -> None:
@@ -1200,6 +1216,24 @@ class MainWindow(QMainWindow):
         else:
             self.pot_dock.show()
             self.pot_dock.raise_()
+
+    # ======================================================================
+    # White meter (Phase 2: the analysis thread does the measuring)
+    # ======================================================================
+
+    def _on_white_reading(self, reading: WhiteReading) -> None:
+        self.white_panel.show_reading(reading)
+
+    def _on_white_dock_visibility(self, visible: bool) -> None:
+        self._white_on_screen = visible  # tracked from this signal, like the pot meter's (see there)
+        self.analysis.set_white_enabled(visible)  # measure only while the panel is on screen
+
+    def _toggle_white_dock(self) -> None:
+        if self._white_on_screen:
+            self.white_dock.hide()
+        else:
+            self.white_dock.show()
+            self.white_dock.raise_()
 
     # ======================================================================
     # MP4 viewing copies (export.py does the work, in a child process)

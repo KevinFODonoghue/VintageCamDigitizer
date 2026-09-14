@@ -45,6 +45,8 @@ QPushButton#recordButton:hover {{ background: #454545; }}
 QPushButton#recordButton[recording="true"] {{ background: #b71c1c; border: 1px solid {REC_RED}; color: white; }}
 QPushButton#resetNeutral[offNeutral="true"] {{ background: #5e4200; border: 1px solid {WARN_AMBER};
                                               color: white; font-weight: 700; }}
+QProgressBar#whiteBar {{ border: 1px solid #555; border-radius: 4px; background: #181818; }}
+QProgressBar#whiteBar::chunk {{ background: #e6e6e6; border-radius: 3px; }}
 QPlainTextEdit#log {{ font-family: Consolas, "Cascadia Mono", monospace; font-size: 9pt; }}
 QScrollArea#previewArea, QScrollArea#previewArea > QWidget > QWidget {{ background: black; }}
 """

@@ -59,7 +59,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .color import BLACK_Y, KB, KR, MAX_C, MIN_C, NEUTRAL_C, WHITE_Y, split_uyvy
+from .color import split_uyvy, ycbcr_to_rgb_float
 
 GRID_COLUMNS, GRID_ROWS = 20, 15  # square cells on a 4:3 picture
 #: Where the grid sits in the frame, as fractions of its width and height: clear
@@ -79,10 +79,20 @@ MIN_EFFECT = 1.0  # a pot that changes the grid less than this (RMS, code values
 DARK_WARNING = 120.0  # an average below this: the camera probably isn't looking at a lit white card
 
 
+def picture_area(height: int, width: int) -> tuple[int, int, int, int]:
+    """Where the picture is in a frame, in pixels: (left, right, top, bottom), clear of the Elgato's blanking.
+
+    The grid covers exactly this area, and the white meter averages it.
+    """
+    return (round(GRID_LEFT * width), round(GRID_RIGHT * width),
+            round(GRID_TOP * height), round(GRID_BOTTOM * height))
+
+
 def grid_edges(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
     """The grid's cell boundaries in pixels: GRID_COLUMNS + 1 x positions and GRID_ROWS + 1 y positions."""
-    xs = np.round(np.linspace(GRID_LEFT * width, GRID_RIGHT * width, GRID_COLUMNS + 1)).astype(int)
-    ys = np.round(np.linspace(GRID_TOP * height, GRID_BOTTOM * height, GRID_ROWS + 1)).astype(int)
+    left, right, top, bottom = picture_area(height, width)
+    xs = np.round(np.linspace(left, right, GRID_COLUMNS + 1)).astype(int)
+    ys = np.round(np.linspace(top, bottom, GRID_ROWS + 1)).astype(int)
     return xs, ys
 
 
@@ -91,17 +101,6 @@ def _cell_means(plane: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray
     block = plane[ys[0]:ys[-1], xs[0]:xs[-1]].astype(np.float64)
     sums = np.add.reduceat(np.add.reduceat(block, ys[:-1] - ys[0], axis=0), xs[:-1] - xs[0], axis=1)
     return sums / np.outer(np.diff(ys), np.diff(xs))
-
-
-def _to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
-    """BT.601 limited-range Y'CbCr → full-range RGB, as floats and not clipped (color.ycbcr_to_rgb's formula)."""
-    yf = (y - BLACK_Y) * (255.0 / (WHITE_Y - BLACK_Y))
-    pb = (cb - NEUTRAL_C) * (255.0 / (MAX_C - MIN_C))
-    pr = (cr - NEUTRAL_C) * (255.0 / (MAX_C - MIN_C))
-    r = yf + 2 * (1 - KR) * pr
-    b = yf + 2 * (1 - KB) * pb
-    g = (yf - KR * r - KB * b) / (1 - KR - KB)
-    return np.stack([r, g, b], axis=-1)
 
 
 def cell_colours(uyvy: np.ndarray) -> np.ndarray:
@@ -113,7 +112,7 @@ def cell_colours(uyvy: np.ndarray) -> np.ndarray:
     """
     y, cb, cr = split_uyvy(uyvy)
     xs, ys = grid_edges(uyvy.shape[0], uyvy.shape[1] // 2)
-    return _to_rgb(_cell_means(y, xs, ys), _cell_means(cb, xs // 2, ys), _cell_means(cr, xs // 2, ys))
+    return ycbcr_to_rgb_float(_cell_means(y, xs, ys), _cell_means(cb, xs // 2, ys), _cell_means(cr, xs // 2, ys))
 
 
 def reference_from_rgb(rgb: np.ndarray, aspect: float = GRID_ASPECT) -> np.ndarray:

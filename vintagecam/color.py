@@ -104,6 +104,22 @@ def ycbcr_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
 
 
+def ycbcr_to_rgb_float(y, cb, cr) -> np.ndarray:
+    """The same conversion without rounding or clipping, as floats: for measurements.
+
+    It's a straight-line (affine) formula, so it can convert averages: the
+    average Y', Cb and Cr of an area give that area's average R, G and B.  Takes
+    arrays or plain numbers; R, G and B come back along the last axis.
+    """
+    yf = (np.asarray(y, np.float64) - BLACK_Y) * (255.0 / (WHITE_Y - BLACK_Y))
+    pb = (np.asarray(cb, np.float64) - NEUTRAL_C) * (255.0 / (MAX_C - MIN_C))
+    pr = (np.asarray(cr, np.float64) - NEUTRAL_C) * (255.0 / (MAX_C - MIN_C))
+    r = yf + 2 * (1 - KR) * pr
+    b = yf + 2 * (1 - KB) * pb
+    g = (yf - KR * r - KB * b) / (1 - KR - KB)
+    return np.stack([r, g, b], axis=-1)
+
+
 def uyvy_to_rgb(uyvy: np.ndarray) -> np.ndarray:
     """Reference UYVY -> RGB (height, width, 3), each chroma sample shared by 2 pixels."""
     y, cb, cr = split_uyvy(uyvy)

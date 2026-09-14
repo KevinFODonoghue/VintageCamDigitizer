@@ -193,7 +193,7 @@ class AnalysisThreadTests(unittest.TestCase):
         self.slot = LatestSlot()
         self.thread = AnalysisThread(self.statuses.append, live_frames=3, measure_frames=5)
         self.thread.set_source(self.slot)
-        self.thread.set_enabled(True)
+        self.thread.set_pot_enabled(True)
         self.thread.start()
 
     def tearDown(self):
@@ -253,7 +253,7 @@ class AnalysisThreadTests(unittest.TestCase):
         self.wait_for(lambda s: "picture is dark" in s.note)
 
     def test_nothing_is_analysed_while_switched_off(self):
-        self.thread.set_enabled(False)
+        self.thread.set_pot_enabled(False)
         time.sleep(0.1)
         self.slot.put(frame_from_uyvy(solid(255, 255, 255), NTSC))
         time.sleep(0.3)

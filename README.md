@@ -71,10 +71,11 @@ The full notes are in [docs/SETUP.md](docs/SETUP.md). In short:
 | **Device** (right) | The capture device, input (Composite / S-Video), TV standard, signal lock, and the **proc amp** (the card's own brightness, contrast, saturation and hue). |
 | **Recording** (right) | The big record button, elapsed time, file size, data rate, free disk space and time left, dropped frames, and the audio level. |
 | **Pot meter** (right, a tab beside Recording) | Tells you when a pot is at its best position: see [Pot meter](#pot-meter-phase-2). |
+| **White meter** (right, a tab beside Recording) | How white the picture is, as a live percentage and a bar: see [White meter](#white-meter-phase-2). |
 | **Log** (bottom) | Everything that happens, with a timestamp. Warnings are amber and errors red. Nothing fails silently. A full debug log goes to `logs/vintagecam.log`. |
 | **Status bar** | Capture state, measured fps, the app's display lag, and any frames dropped by the device. |
 
-Panels can be hidden (Ctrl+1/2/3/4), dragged or floated. The layout is remembered.
+Panels can be hidden (Ctrl+1 to 5), dragged or floated. The layout is remembered.
 
 ## Keyboard shortcuts
 
@@ -98,6 +99,7 @@ because you'll have one hand inside the camera.
 | **Ctrl+O** | Open the recordings folder |
 | **Ctrl+E** | Export MP4 viewing copies of recordings |
 | **Ctrl+4** | Show or hide the pot meter |
+| **Ctrl+5** | Show or hide the white meter |
 | **F1** | Show this list |
 
 Phase 2 will add **V** (vectorscope), **W** (waveform) and **H** (hold reading).
@@ -437,6 +439,35 @@ back. The photo is remembered between sessions.
 - The measuring runs on its own thread, and only while the panel is on screen.
   `vintagecam/pot_meter.py` explains the details.
 
+## White meter (Phase 2)
+
+One live number for how white the picture is. Point the camera at a white card,
+open the panel with **Ctrl+5** (or its tab next to Recording), and turn a pot:
+the number and the bar go up as the picture gets whiter. 100% is pure white and
+0% is black.
+
+It averages the colour of the whole picture, ten times a second. Only the
+Elgato's black band down the left edge is left out: averaged in, it would hold
+even a pure white picture below 98%. The panel also shows that average colour.
+
+**Percent white** is the average colour's brightness (the mean of its red,
+green and blue, out of 255) less how unequal the three are (√2 × their RMS
+spread), so:
+
+- a neutral grey reads its brightness (mid grey: 50%);
+- a tint lowers it. A colour can't be whiter than its weakest primary, and
+  when the other two are equal it reads exactly that: red and green at 230 with
+  blue at 200 is 78%. Any fully saturated colour reads 0%;
+- turning one colour up raises the number until that colour matches the
+  strongest of the other two; past that the number falls, so pushing one colour
+  past the others never helps.
+
+Brightness counts as well as colour, so the iris, the lighting or a gain pot
+move the number too, and an over-exposed picture reads 100%. To find a pot's
+best position whatever the lighting, use the [pot meter](#pot-meter-phase-2).
+The white meter runs only while its panel is on screen;
+`vintagecam/white_meter.py` explains the details.
+
 ## Verified on the target machine
 
 Measured with `tools/hardware_check.py` and the tests, on 2026-09-10:
@@ -483,9 +514,12 @@ The unit tests cover:
 - audio stored bit-for-bit and starting in step with the video, and sync holding
   when the audio clock runs fast;
 - choosing the audio input (with a stand-in for PortAudio);
+- the pot meter and the white meter, on synthetic white cards and a simulated
+  pot, including the Elgato's blanking band;
 - the real main window, run off-screen: every overlay shortcut toggles,
   deinterlace cycles, freeze works, a frame is drawn in true colour, a stuck
-  driver is waited out, and switching away from a locked picture asks first.
+  driver is waited out, switching away from a locked picture asks first, and
+  the meters measure only while their panels are on screen.
 
 ## Project layout
 
@@ -498,11 +532,15 @@ vintagecam/
   capture.py              CaptureThread: owns the device, fans frames out, reconnects
   recorder.py             RecordThread: FFV1 (+ PCM sound) MKV writer that never blocks capture
   audio.py                the Elgato's line input via Windows kernel streaming (sounddevice / PortAudio)
+  export.py               MP4 viewing copies (H.264 + AAC), made in a low-priority child process
+  analysis.py             the analysis thread: runs the pot meter and the white meter on the newest frames
+  pot_meter.py            the pot meter: a 20 × 15 grid of average colours, judged against white
+  white_meter.py          the white meter: the picture's average colour, as percent white
   render.py               preview colour conversion (BT.601, limited -> full range)
   dshow.py                DirectShow COM via ctypes: device list, proc amp, TV standard, signal lock
   errors.py               FFmpeg/DirectShow failures -> messages you can act on
   config.py               settings.json load/save, hardware constants
-  ui/                     main window, preview + overlays, device/record/log panels, theme
+  ui/                     main window, preview + overlays, device/record/log/pot/white panels, theme
 tools/hardware_check.py   end-to-end check against the real card
 tests/                    unit tests (no hardware needed)
 docs/SETUP.md             machine setup and known-good ffmpeg commands
@@ -513,8 +551,8 @@ CLAUDE_CODE_PROMPT.md     the project brief
 
 - `CaptureThread` owns the single device handle and hands every frame to
   `RecordThread` through a bounded queue.
-- It hands only the **newest** frame to the screen (and, in Phase 2, to the
-  analysis thread) through single-slot buffers.
+- It hands only the **newest** frame to the screen, and to the analysis thread
+  (which runs the pot meter and the white meter), through single-slot buffers.
 - The GUI thread never decodes; it converts and draws the one frame it's given.
 
 ## Settings

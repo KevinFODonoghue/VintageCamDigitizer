@@ -95,24 +95,24 @@ class MainWindowTests(unittest.TestCase):
             add.assert_not_called()
 
     def test_pot_meter_measures_only_while_its_panel_is_showing(self):
-        self.assertFalse(self.win.analysis.enabled)  # the panel starts behind the Recording tab
+        self.assertFalse(self.win.analysis.pot_enabled)  # the panel starts behind the Recording tab
         self.win._toggle_pot_dock()
         app.processEvents()
         self.assertFalse(self.win.pot_dock.visibleRegion().isEmpty())  # really on screen now
-        self.assertTrue(self.win.analysis.enabled)
+        self.assertTrue(self.win.analysis.pot_enabled)
         self.assertTrue(self.win.preview.overlays.pot_grid)
         self.win.record_dock.raise_()  # as clicking the Recording tab does: the pot meter goes behind it
         app.processEvents()
-        self.assertFalse(self.win.analysis.enabled)
+        self.assertFalse(self.win.analysis.pot_enabled)
         self.assertFalse(self.win.preview.overlays.pot_grid)
         self.win._toggle_pot_dock()  # back in front…
         app.processEvents()
-        self.assertTrue(self.win.analysis.enabled)
+        self.assertTrue(self.win.analysis.pot_enabled)
         self.win.pot_panel.grid_check.setChecked(False)
         self.assertFalse(self.win.preview.overlays.pot_grid)
         self.win._toggle_pot_dock()  # …and closed
         app.processEvents()
-        self.assertFalse(self.win.analysis.enabled)
+        self.assertFalse(self.win.analysis.pot_enabled)
 
     def test_the_pot_meter_light(self):
         from vintagecam.analysis import PotStatus
@@ -159,6 +159,57 @@ class MainWindowTests(unittest.TestCase):
         self.win._use_reference_photo(portrait)  # refused, with a message; back to plain white
         self.assertEqual(self.win.settings.pot_reference_photo, "")
         self.assertIn("Plain white", self.win.pot_panel.reference_label.text())
+
+    def test_white_meter_measures_only_while_its_panel_is_showing(self):
+        self.assertFalse(self.win.analysis.white_enabled)  # the panel starts behind the Recording tab
+        self.win._toggle_white_dock()
+        app.processEvents()
+        self.assertFalse(self.win.white_dock.visibleRegion().isEmpty())  # really on screen now
+        self.assertTrue(self.win.analysis.white_enabled)
+        self.assertFalse(self.win.analysis.pot_enabled)  # the pot meter's tab is behind it
+        self.win.record_dock.raise_()  # as clicking the Recording tab does
+        app.processEvents()
+        self.assertFalse(self.win.analysis.white_enabled)
+        self.win._toggle_white_dock()  # back in front…
+        app.processEvents()
+        self.assertTrue(self.win.analysis.white_enabled)
+        self.win._toggle_white_dock()  # …and closed
+        app.processEvents()
+        self.assertFalse(self.win.analysis.white_enabled)
+
+    def test_the_white_meter_panel(self):
+        from vintagecam.white_meter import WhiteReading
+
+        panel = self.win.white_panel
+        self.assertEqual((panel.percent_label.text(), panel.bar.value()), ("—", 0))  # nothing measured yet
+        panel.show_reading(WhiteReading(87.46, (231.0, 229.6, 222.4)))
+        self.assertEqual((panel.percent_label.text(), panel.bar.value()), ("87.5%", 875))
+        self.assertIn("R 231", panel.colour_label.text())
+        panel.set_signal(False)
+        self.assertFalse(panel.signal_label.isHidden())
+        panel.clear()
+        self.assertEqual((panel.percent_label.text(), panel.bar.value()), ("—", 0))
+
+    def test_the_white_meter_shows_how_white_the_picture_is(self):
+        import time
+
+        from vintagecam.frames import LatestSlot
+
+        slot = LatestSlot()
+        self.win.analysis.set_source(slot)
+        self.win._toggle_white_dock()
+        rgb = np.zeros((480, 720, 3), np.uint8)
+        rgb[:] = (230, 230, 200)  # a warm white card: red and green equal, blue short
+        frame = frame_from_uyvy(color.rgb_to_uyvy(rgb), NTSC)
+        panel = self.win.white_panel
+        deadline = time.monotonic() + 5
+        while panel.bar.value() == 0 and time.monotonic() < deadline:
+            slot.put(frame)
+            app.processEvents()
+            time.sleep(0.02)
+        self.assertAlmostEqual(panel.bar.value() / 10, 100 * 200 / 255, delta=1.0)  # as white as its blue
+        self.assertAlmostEqual(float(panel.percent_label.text().rstrip("%")), panel.bar.value() / 10, delta=0.06)
+        self.assertIn("Average colour", panel.colour_label.text())
 
     def test_record_key_without_video_does_not_start_a_recording(self):
         self.press(Qt.Key.Key_R)
